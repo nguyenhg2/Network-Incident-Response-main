@@ -1,0 +1,49 @@
+version: '3.9'
+
+services:
+  mongo:
+    image: mongo:6
+    container_name: incident_mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  backend:
+    build: ./backend
+    container_name: incident_backend
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017
+      - MONGODB_DB=incident_response
+      - JWT_SECRET=dev-secret
+      - CORS_ORIGINS=http://localhost:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+
+  frontend:
+    build: ./frontend
+    container_name: incident_frontend
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+  seed:
+    build: ./backend
+    container_name: incident_seed
+    command: ["/bin/sh", "-c", "sleep 2 && python -m app.seed.seed_data"]
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017
+      - MONGODB_DB=incident_response
+      - JWT_SECRET=dev-secret
+    depends_on:
+      - mongo
+    profiles:
+      - seed
+
+volumes:
+  mongo_data:

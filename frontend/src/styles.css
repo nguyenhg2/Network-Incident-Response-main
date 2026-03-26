@@ -1,0 +1,69 @@
+html,
+body,
+#root {
+  height: 100%;
+}
+
+.map-shell {
+  flex: 1;
+  min-height: 320px;
+}
+
+.pulse-marker {
+  background: transparent;
+}
+
+.pulse-marker .pulse-ring {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border: 3px solid rgba(211, 47, 47, 0.9);
+  border-radius: 50%;
+  animation: pulse-ring 1.6s ease-out infinite;
+}
+
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.9;
+  }
+  70% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.2);
+    opacity: 0;
+  }
+}
+
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  border-radius: 8px;
+}
+
+.unit-map-shell {
+  height: 220px;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.unit-label-tooltip {
+  background: rgba(27, 94, 32, 0.9);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 12px;
+  padding: 2px 6px;
+  box-shadow: none;
+}
+
+.unit-label-tooltip::before {
+  border-top-color: rgba(27, 94, 32, 0.9);
+}
+
+.support-station-icon.leaflet-marker-icon {
+  filter: hue-rotate(140deg) saturate(1.4);
+}
