@@ -5,6 +5,7 @@ import {
   Card,
   CardContent,
   Dialog,
+  DialogActions,
   DialogContent,
   DialogTitle,
   Divider,
@@ -31,7 +32,7 @@ import {
   Checkbox,
   Typography
 } from '@mui/material'
-import { MapContainer, Marker, Polyline, Popup, TileLayer, Tooltip, useMapEvents } from 'react-leaflet'
+import { MapContainer, Marker, Polyline, Popup, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet'
 import L from 'leaflet'
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
 import markerIcon from 'leaflet/dist/images/marker-icon.png'
@@ -61,8 +62,8 @@ const MAP_ATTRIBUTION =
 const ROUTER_BASE_URL = (
   import.meta.env.VITE_ROUTER_URL || 'https://router.project-osrm.org'
 ).replace(/\/$/, '')
+const MAP_STATE_KEY = 'company_map_state'
 
-// Fix default marker icons in Leaflet with Vite
 const DefaultIcon = L.icon({
   iconRetinaUrl: markerIcon2x,
   iconUrl: markerIcon,
@@ -88,33 +89,91 @@ const supportStationIcon = L.icon({
   className: 'support-station-icon'
 })
 
+interface RouteInfo {
+  coords: [number, number][]
+  distance: number | null
+  duration: number | null
+}
+
+const routeCache = new Map<string, RouteInfo>()
+
+function routeCacheKey(lat1: number, lng1: number, lat2: number, lng2: number) {
+  const r = (n: number) => Math.round(n * 1e4)
+  return `${r(lat1)},${r(lng1)}-${r(lat2)},${r(lng2)}`
+}
+
+async function fetchOsrmRoute(
+  fLat: number, fLng: number, tLat: number, tLng: number, signal?: AbortSignal
+): Promise<RouteInfo> {
+  const key = routeCacheKey(fLat, fLng, tLat, tLng)
+  const cached = routeCache.get(key)
+  if (cached) return cached
+  try {
+    const url = `${ROUTER_BASE_URL}/route/v1/driving/${fLng},${fLat};${tLng},${tLat}?overview=full&geometries=geojson`
+    const res = await fetch(url, { signal })
+    if (!res.ok) throw new Error('fail')
+    const data = await res.json()
+    const route = data.routes?.[0]
+    if (!route?.geometry?.coordinates?.length) throw new Error('no route')
+    const info: RouteInfo = {
+      coords: route.geometry.coordinates.map(([lng, lat]: [number, number]) => [lat, lng] as [number, number]),
+      distance: route.distance ?? null,
+      duration: route.duration ?? null
+    }
+    routeCache.set(key, info)
+    return info
+  } catch {
+    return { coords: [[fLat, fLng], [tLat, tLng]], distance: null, duration: null }
+  }
+}
+
+function fmtDistance(m: number | null) {
+  if (m == null) return '--'
+  return m >= 1000 ? `${(m / 1000).toFixed(1)} km` : `${Math.round(m)} m`
+}
+
+function fmtDuration(s: number | null) {
+  if (s == null) return '--'
+  const h = Math.floor(s / 3600)
+  const m = Math.round((s % 3600) / 60)
+  return h > 0 ? `${h}h ${m}m` : `${m} phut`
+}
+
+function getSavedMapState(): { center: [number, number]; zoom: number } | null {
+  try {
+    const raw = localStorage.getItem(MAP_STATE_KEY)
+    if (!raw) return null
+    const obj = JSON.parse(raw)
+    if (Array.isArray(obj.center) && typeof obj.zoom === 'number') return obj
+  } catch { /* ignore */ }
+  return null
+}
+
+function saveMapState(center: [number, number], zoom: number) {
+  localStorage.setItem(MAP_STATE_KEY, JSON.stringify({ center, zoom }))
+}
+
+function MapStateTracker() {
+  const map = useMap()
+  useMapEvents({
+    moveend() { const c = map.getCenter(); saveMapState([c.lat, c.lng], map.getZoom()) },
+    zoomend() { const c = map.getCenter(); saveMapState([c.lat, c.lng], map.getZoom()) }
+  })
+  return null
+}
+
 function UnitLocationPicker({
-  lat,
-  lng,
-  onChange
-}: {
-  lat: number | null
-  lng: number | null
-  onChange: (lat: number, lng: number) => void
-}) {
+  lat, lng, onChange
+}: { lat: number | null; lng: number | null; onChange: (lat: number, lng: number) => void }) {
   function ClickHandler() {
-    useMapEvents({
-      click(event) {
-        onChange(event.latlng.lat, event.latlng.lng)
-      }
-    })
+    useMapEvents({ click(event) { onChange(event.latlng.lat, event.latlng.lng) } })
     return null
   }
-
   const center: [number, number] = lat != null && lng != null ? [lat, lng] : [16.0, 106.0]
-
   return (
     <Box className="unit-map-shell">
       <MapContainer center={center} zoom={lat != null && lng != null ? 12 : 5} style={{ height: '100%', width: '100%' }}>
-        <TileLayer
-          attribution={MAP_ATTRIBUTION}
-          url={MAP_TILE_URL}
-        />
+        <TileLayer attribution={MAP_ATTRIBUTION} url={MAP_TILE_URL} />
         <ClickHandler />
         {lat != null && lng != null && <Marker position={[lat, lng]} />}
       </MapContainer>
@@ -122,9 +181,11 @@ function UnitLocationPicker({
   )
 }
 
-interface CompanyPortalProps {
-  user: User
+interface RoutableIncident extends Incident {
+  _routeType: 'dispatched' | 'open'
 }
+
+interface CompanyPortalProps { user: User }
 
 function CompanyPortal({ user }: CompanyPortalProps) {
   const [units, setUnits] = useState<Unit[]>([])
@@ -139,12 +200,17 @@ function CompanyPortal({ user }: CompanyPortalProps) {
   const [dispatchRuns, setDispatchRuns] = useState<DispatchRun[]>([])
   const [result, setResult] = useState<OptimizeResult | null>(null)
   const [optimizing, setOptimizing] = useState(false)
-  const [routeLines, setRouteLines] = useState<Record<string, [number, number][]>>({})
+  const [routeLines, setRouteLines] = useState<Record<string, RouteInfo>>({})
+  const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null)
+  const [previewOpen, setPreviewOpen] = useState(false)
+  const [previewResult, setPreviewResult] = useState<OptimizeResult | null>(null)
+
   const unitNameById = useMemo(() => new Map(units.map((u) => [u._id, u.name])), [units])
   const unitById = useMemo(() => new Map(units.map((u) => [u._id, u])), [units])
   const techNameById = useMemo(() => new Map(technicians.map((t) => [t._id, t.name])), [technicians])
   const incidentById = useMemo(() => new Map(incidents.map((i) => [i._id, i])), [incidents])
   const componentNameById = new Map(components.map((c) => [c._id, c.name]))
+
   const [mainTab, setMainTab] = useState(0)
   const [manageTab, setManageTab] = useState(0)
   const [incidentPage, setIncidentPage] = useState(0)
@@ -165,12 +231,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
   })
 
   const [techForm, setTechForm] = useState({
-    name: '',
-    skills: [] as string[],
-    lat: '',
-    lng: '',
-    address: '',
-    availableNow: true,
+    name: '', skills: [] as string[], lat: '', lng: '', address: '', availableNow: true,
     dMatrixRows: [] as Array<{ typeCode: string; mode: 'R' | 'O'; durationHours: string }>
   })
   const [toolForm, setToolForm] = useState({ name: '', typeCode: '', availableQty: 1 })
@@ -192,12 +253,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
   const [unitDialogMode, setUnitDialogMode] = useState<'add' | 'edit'>('add')
   const [editingUnitId, setEditingUnitId] = useState<string | null>(null)
   const [unitForm, setUnitForm] = useState({
-    name: '',
-    address: '',
-    lat: '',
-    lng: '',
-    remoteAccessReady: false,
-    isSupportStation: false
+    name: '', address: '', lat: '', lng: '', remoteAccessReady: false, isSupportStation: false
   })
   const [skillDialogOpen, setSkillDialogOpen] = useState(false)
   const [skillDialogMode, setSkillDialogMode] = useState<'add' | 'edit'>('add')
@@ -207,18 +263,9 @@ function CompanyPortal({ user }: CompanyPortalProps) {
   const [incidentTypeDialogMode, setIncidentTypeDialogMode] = useState<'add' | 'edit'>('add')
   const [editingIncidentTypeId, setEditingIncidentTypeId] = useState<string | null>(null)
   const [incidentTypeForm, setIncidentTypeForm] = useState({
-    code: '',
-    name: '',
-    defaultPriority: 3,
-    defaultSetupRemote: 0.5,
-    defaultFeasRemote: true,
-    defaultFeasOnsite: true,
-    requiredSkills: [] as string[],
-    toolsR: '',
-    toolsO: '',
-    licensesR: '',
-    licensesO: '',
-    requiresVehicleIfOnsite: false
+    code: '', name: '', defaultPriority: 3, defaultSetupRemote: 0.5,
+    defaultFeasRemote: true, defaultFeasOnsite: true, requiredSkills: [] as string[],
+    toolsR: '', toolsO: '', licensesR: '', licensesO: '', requiresVehicleIfOnsite: false
   })
 
   const availableTechs = technicians.filter((t) => t.availableNow).length
@@ -226,46 +273,75 @@ function CompanyPortal({ user }: CompanyPortalProps) {
   const existingStation = units.find((u) => u.isSupportStation)
   const stationLocked = Boolean(existingStation && existingStation._id !== editingUnitId)
   const stationLocation = existingStation?.location
-  const stationReady = Boolean(stationLocation)
+
   const toolTypeOptions = Array.from(
-    new Map(
-      [
-        ...tools.map((tool) => [tool.typeCode, tool.name]),
-        ...requirementsForm.toolsR.map((code) => [code, code]),
-        ...requirementsForm.toolsO.map((code) => [code, code])
-      ] as Array<[string, string]>
-    ).entries()
+    new Map([
+      ...tools.map((tool) => [tool.typeCode, tool.name]),
+      ...requirementsForm.toolsR.map((code) => [code, code]),
+      ...requirementsForm.toolsO.map((code) => [code, code])
+    ] as Array<[string, string]>).entries()
   ).map(([typeCode, name]) => ({ typeCode, name }))
+
   const licenseTypeOptions = Array.from(
-    new Map(
-      [
-        ...licenses.map((lic) => [lic.typeCode, lic.name]),
-        ...requirementsForm.licensesR.map((code) => [code, code]),
-        ...requirementsForm.licensesO.map((code) => [code, code])
-      ] as Array<[string, string]>
-    ).entries()
+    new Map([
+      ...licenses.map((lic) => [lic.typeCode, lic.name]),
+      ...requirementsForm.licensesR.map((code) => [code, code]),
+      ...requirementsForm.licensesO.map((code) => [code, code])
+    ] as Array<[string, string]>).entries()
   ).map(([typeCode, name]) => ({ typeCode, name }))
+
   const activeIncidents = incidents.filter((inc) => inc.status !== 'RESOLVED')
   const onsiteDispatches = activeIncidents.filter((inc) => inc.dispatch?.mode === 'O')
+  const openIncidents = activeIncidents.filter((inc) => inc.status === 'OPEN')
+
+  const routableIncidents = useMemo<RoutableIncident[]>(() => {
+    const dispatched: RoutableIncident[] = onsiteDispatches.map((inc) => ({ ...inc, _routeType: 'dispatched' }))
+    const open: RoutableIncident[] = openIncidents
+      .filter((inc) => !onsiteDispatches.some((d) => d._id === inc._id))
+      .map((inc) => ({ ...inc, _routeType: 'open' }))
+    return [...dispatched, ...open]
+  }, [onsiteDispatches, openIncidents])
+
+  const routableKey = useMemo(
+    () => routableIncidents.map((i) => `${i._id}:${i._routeType}:${i.unitId}`).join('|'),
+    [routableIncidents]
+  )
+
+  const fallbackLines = useMemo<Record<string, RouteInfo>>(() => {
+    if (!stationLocation) return {}
+    const entries: [string, RouteInfo][] = []
+    for (const inc of routableIncidents) {
+      const unit = unitById.get(inc.unitId)
+      if (!unit?.location) continue
+      entries.push([inc._id, {
+        coords: [[stationLocation.lat, stationLocation.lng], [unit.location.lat, unit.location.lng]],
+        distance: null,
+        duration: null
+      }])
+    }
+    return Object.fromEntries(entries)
+  }, [stationLocation, routableKey, unitById])
+
   const incidentRowsPerPage = 5
   const pagedIncidents = activeIncidents.slice(
     incidentPage * incidentRowsPerPage,
     incidentPage * incidentRowsPerPage + incidentRowsPerPage
   )
+
   const statusLabel = (status: string) => {
-    if (status === 'DISPATCHED' || status === 'IN_PROGRESS' || status === 'DISPATCHING') return 'Đang điều phối'
-    if (status === 'OPEN') return 'Mở'
-    if (status === 'RESOLVED') return 'Hoàn tất'
+    if (status === 'DISPATCHED' || status === 'IN_PROGRESS' || status === 'DISPATCHING') return 'Dang dieu phoi'
+    if (status === 'OPEN') return 'Mo'
+    if (status === 'RESOLVED') return 'Hoan tat'
     return status
   }
+
   const statusBuckets = [
-    { key: 'OPEN', label: 'Mở', color: '#0277bd' },
-    { key: 'DISPATCHING', label: 'Đang điều phối', color: '#f9a825' },
-    { key: 'RESOLVED', label: 'Hoàn tất', color: '#2e7d32' }
+    { key: 'OPEN', label: 'Mo', color: '#0277bd' },
+    { key: 'DISPATCHING', label: 'Dang dieu phoi', color: '#f9a825' },
+    { key: 'RESOLVED', label: 'Hoan tat', color: '#2e7d32' }
   ]
   const rawStatusCounts = incidents.reduce<Record<string, number>>((acc, inc) => {
-    acc[inc.status] = (acc[inc.status] ?? 0) + 1
-    return acc
+    acc[inc.status] = (acc[inc.status] ?? 0) + 1; return acc
   }, {})
   const statusCounts: Record<string, number> = {
     OPEN: rawStatusCounts.OPEN ?? 0,
@@ -274,12 +350,9 @@ function CompanyPortal({ user }: CompanyPortalProps) {
   }
   const maxStatusCount = Math.max(1, ...statusBuckets.map((b) => statusCounts[b.key] ?? 0))
   const typeCounts = incidents.reduce<Record<string, number>>((acc, inc) => {
-    acc[inc.typeCode] = (acc[inc.typeCode] ?? 0) + 1
-    return acc
+    acc[inc.typeCode] = (acc[inc.typeCode] ?? 0) + 1; return acc
   }, {})
-  const typeData = Object.entries(typeCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
+  const typeData = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]).slice(0, 5)
   const maxTypeCount = Math.max(1, ...typeData.map(([, count]) => count))
 
   const load = async () => {
@@ -313,459 +386,279 @@ function CompanyPortal({ user }: CompanyPortalProps) {
 
   useEffect(() => {
     load()
-    const id = setInterval(load, 8000)
+    const id = setInterval(load, 5000)
     return () => clearInterval(id)
   }, [])
 
   useEffect(() => {
-    if (!stationLocation) {
-      setRouteLines({})
-      return
-    }
-    const requests = onsiteDispatches
+    if (!stationLocation || routableIncidents.length === 0) return
+    const requests = routableIncidents
       .map((inc) => {
         const unit = unitById.get(inc.unitId)
         if (!unit?.location) return null
         return { incidentId: inc._id, unit }
       })
       .filter(Boolean) as Array<{ incidentId: string; unit: Unit }>
-    if (requests.length === 0) {
-      setRouteLines({})
+    if (requests.length === 0) return
+    const allCached = requests.every(({ unit }) =>
+      routeCache.has(routeCacheKey(stationLocation.lat, stationLocation.lng, unit.location.lat, unit.location.lng))
+    )
+    if (allCached) {
+      const entries = requests.map(({ incidentId, unit }) => {
+        const info = routeCache.get(routeCacheKey(stationLocation.lat, stationLocation.lng, unit.location.lat, unit.location.lng))!
+        return [incidentId, info] as const
+      })
+      setRouteLines(Object.fromEntries(entries))
       return
     }
-    const controller = new AbortController()
-    const fetchRoutes = async () => {
-      const entries = await Promise.all(
-        requests.map(async ({ incidentId, unit }) => {
-          const url = `${ROUTER_BASE_URL}/route/v1/driving/${stationLocation.lng},${stationLocation.lat};${unit.location.lng},${unit.location.lat}?overview=full&geometries=geojson`
-          try {
-            const res = await fetch(url, { signal: controller.signal })
-            if (!res.ok) {
-              throw new Error('route fetch failed')
-            }
-            const data = await res.json()
-            const coords = data.routes?.[0]?.geometry?.coordinates
-            if (!coords || coords.length === 0) {
-              throw new Error('no route')
-            }
-            const latlngs = coords.map(
-              ([lng, lat]: [number, number]) => [lat, lng] as [number, number]
-            )
-            return [incidentId, latlngs] as const
-          } catch {
-            return [
-              incidentId,
-              [
-                [stationLocation.lat, stationLocation.lng],
-                [unit.location.lat, unit.location.lng]
-              ] as [number, number][]
-            ] as const
-          }
-        })
-      )
-      if (!controller.signal.aborted) {
-        setRouteLines(Object.fromEntries(entries))
+    let cancelled = false
+    ;(async () => {
+      const entries: [string, RouteInfo][] = []
+      for (const { incidentId, unit } of requests) {
+        if (cancelled) return
+        const key = routeCacheKey(stationLocation.lat, stationLocation.lng, unit.location.lat, unit.location.lng)
+        if (routeCache.has(key)) {
+          entries.push([incidentId, routeCache.get(key)!])
+          continue
+        }
+        const info = await fetchOsrmRoute(
+          stationLocation.lat, stationLocation.lng,
+          unit.location.lat, unit.location.lng
+        )
+        entries.push([incidentId, info])
+        if (!cancelled) setRouteLines((prev) => ({ ...prev, [incidentId]: info }))
+        await new Promise((r) => setTimeout(r, 300))
       }
-    }
-    fetchRoutes()
-    return () => controller.abort()
-  }, [stationLocation, onsiteDispatches, unitById])
+      if (!cancelled) setRouteLines(Object.fromEntries(entries))
+    })()
+    return () => { cancelled = true }
+  }, [stationLocation, routableKey])
+
 
   const handleOptimize = async () => {
     setOptimizing(true)
     try {
       const res = await api.post<OptimizeResult>('/api/optimize/dispatch-now', {})
-      setResult(res.data)
-      await load()
+      setPreviewResult(res.data)
+      setPreviewOpen(true)
     } finally {
       setOptimizing(false)
     }
   }
 
+  const handleConfirmDispatch = async () => {
+    setPreviewOpen(false)
+    setResult(previewResult)
+    await load()
+  }
+
+  const handleCancelPreview = async () => {
+    setPreviewOpen(false)
+    if (previewResult) {
+      for (const a of previewResult.assignments) {
+        try { await api.post(`/api/incidents/${a.incidentId}/cancel`) } catch { /* ignore */ }
+      }
+    }
+    setPreviewResult(null)
+    await load()
+  }
+
   const openAddTech = () => {
-    setTechDialogMode('add')
-    setEditingTechId(null)
-    const stationLat = stationLocation?.lat != null ? String(stationLocation.lat) : ''
-    const stationLng = stationLocation?.lng != null ? String(stationLocation.lng) : ''
-    const stationAddress = stationLocation?.address ?? ''
-    setTechForm({
-      name: '',
-      skills: [],
-      lat: stationLat,
-      lng: stationLng,
-      address: stationAddress,
-      availableNow: true,
-      dMatrixRows: []
-    })
+    setTechDialogMode('add'); setEditingTechId(null)
+    const sLat = stationLocation?.lat != null ? String(stationLocation.lat) : ''
+    const sLng = stationLocation?.lng != null ? String(stationLocation.lng) : ''
+    const sAddr = stationLocation?.address ?? ''
+    setTechForm({ name: '', skills: [], lat: sLat, lng: sLng, address: sAddr, availableNow: true, dMatrixRows: [] })
     setTechDialogOpen(true)
   }
 
   const openEditTech = (tech: Technician) => {
-    setTechDialogMode('edit')
-    setEditingTechId(tech._id)
-    const stationLat = stationLocation?.lat != null ? String(stationLocation.lat) : ''
-    const stationLng = stationLocation?.lng != null ? String(stationLocation.lng) : ''
-    const stationAddress = stationLocation?.address ?? ''
+    setTechDialogMode('edit'); setEditingTechId(tech._id)
+    const sLat = stationLocation?.lat != null ? String(stationLocation.lat) : ''
+    const sLng = stationLocation?.lng != null ? String(stationLocation.lng) : ''
+    const sAddr = stationLocation?.address ?? ''
     setTechForm({
-      name: tech.name ?? '',
-      skills: tech.skills ?? [],
-      lat: stationLat || (tech.homeLocation?.lat != null ? String(tech.homeLocation.lat) : ''),
-      lng: stationLng || (tech.homeLocation?.lng != null ? String(tech.homeLocation.lng) : ''),
-      address: stationAddress || tech.homeLocation?.address || '',
+      name: tech.name ?? '', skills: tech.skills ?? [],
+      lat: sLat || (tech.homeLocation?.lat != null ? String(tech.homeLocation.lat) : ''),
+      lng: sLng || (tech.homeLocation?.lng != null ? String(tech.homeLocation.lng) : ''),
+      address: sAddr || tech.homeLocation?.address || '',
       availableNow: Boolean(tech.availableNow),
       dMatrixRows: (tech.dMatrix || []).map((entry) => ({
-        typeCode: entry.typeCode,
-        mode: entry.mode as 'R' | 'O',
-        durationHours: String(entry.durationHours)
+        typeCode: entry.typeCode, mode: entry.mode as 'R' | 'O', durationHours: String(entry.durationHours)
       }))
     })
     setTechDialogOpen(true)
   }
 
-  const closeTechDialog = () => {
-    setTechDialogOpen(false)
-  }
-
   const handleSubmitTech = async () => {
-    if (!stationLocation) {
-      return
-    }
-    const lat = Number(stationLocation.lat)
-    const lng = Number(stationLocation.lng)
+    if (!stationLocation) return
     const dMatrix = techForm.dMatrixRows
       .filter((row) => row.typeCode && row.durationHours !== '')
-      .map((row) => ({
-        typeCode: row.typeCode,
-        mode: row.mode,
-        durationHours: Number(row.durationHours)
-      }))
-    const skills = techForm.skills
+      .map((row) => ({ typeCode: row.typeCode, mode: row.mode, durationHours: Number(row.durationHours) }))
     const payload = {
-      name: techForm.name,
-      skills,
-      availableNow: techForm.availableNow,
-      homeLocation: { lat, lng, address: stationLocation.address },
+      name: techForm.name, skills: techForm.skills, availableNow: techForm.availableNow,
+      homeLocation: { lat: stationLocation.lat, lng: stationLocation.lng, address: stationLocation.address },
       dMatrix
     }
-    if (techDialogMode === 'add') {
-      await api.post('/api/technicians', payload)
-    } else if (editingTechId) {
-      await api.patch(`/api/technicians/${editingTechId}`, payload)
-    }
-    setTechDialogOpen(false)
-    await load()
+    if (techDialogMode === 'add') await api.post('/api/technicians', payload)
+    else if (editingTechId) await api.patch(`/api/technicians/${editingTechId}`, payload)
+    setTechDialogOpen(false); await load()
   }
 
-  const handleDeleteTech = async (techId: string) => {
-    await api.delete(`/api/technicians/${techId}`)
-    await load()
-  }
+  const handleDeleteTech = async (id: string) => { await api.delete(`/api/technicians/${id}`); await load() }
 
   const openAddTool = () => {
-    setToolDialogMode('add')
-    setEditingToolId(null)
-    setToolForm({ name: '', typeCode: '', availableQty: 1 })
-    setToolDialogOpen(true)
+    setToolDialogMode('add'); setEditingToolId(null)
+    setToolForm({ name: '', typeCode: '', availableQty: 1 }); setToolDialogOpen(true)
   }
-
-  const openEditTool = (tool: Tool) => {
-    setToolDialogMode('edit')
-    setEditingToolId(tool._id)
-    setToolForm({ name: tool.name, typeCode: tool.typeCode, availableQty: tool.availableQty })
-    setToolDialogOpen(true)
+  const openEditTool = (t: Tool) => {
+    setToolDialogMode('edit'); setEditingToolId(t._id)
+    setToolForm({ name: t.name, typeCode: t.typeCode, availableQty: t.availableQty }); setToolDialogOpen(true)
   }
-
-  const closeToolDialog = () => {
-    setToolDialogOpen(false)
-  }
-
   const handleSubmitTool = async () => {
-    const payload = {
-      name: toolForm.name,
-      typeCode: toolForm.typeCode,
-      availableQty: Number(toolForm.availableQty)
-    }
-    if (toolDialogMode === 'add') {
-      await api.post('/api/tools', payload)
-    } else if (editingToolId) {
-      await api.patch(`/api/tools/${editingToolId}`, payload)
-    }
-    setToolDialogOpen(false)
-    await load()
+    const payload = { name: toolForm.name, typeCode: toolForm.typeCode, availableQty: Number(toolForm.availableQty) }
+    if (toolDialogMode === 'add') await api.post('/api/tools', payload)
+    else if (editingToolId) await api.patch(`/api/tools/${editingToolId}`, payload)
+    setToolDialogOpen(false); await load()
   }
-
-  const handleDeleteTool = async (toolId: string) => {
-    await api.delete(`/api/tools/${toolId}`)
-    await load()
-  }
+  const handleDeleteTool = async (id: string) => { await api.delete(`/api/tools/${id}`); await load() }
 
   const openAddLicense = () => {
-    setLicenseDialogMode('add')
-    setEditingLicenseId(null)
-    setLicenseForm({ name: '', typeCode: '', capTotal: 1, inUseNow: 0 })
+    setLicenseDialogMode('add'); setEditingLicenseId(null)
+    setLicenseForm({ name: '', typeCode: '', capTotal: 1, inUseNow: 0 }); setLicenseDialogOpen(true)
+  }
+  const openEditLicense = (l: License) => {
+    setLicenseDialogMode('edit'); setEditingLicenseId(l._id)
+    setLicenseForm({ name: l.name, typeCode: l.typeCode, capTotal: l.capTotal, inUseNow: l.inUseNow })
     setLicenseDialogOpen(true)
   }
-
-  const openEditLicense = (license: License) => {
-    setLicenseDialogMode('edit')
-    setEditingLicenseId(license._id)
-    setLicenseForm({
-      name: license.name,
-      typeCode: license.typeCode,
-      capTotal: license.capTotal,
-      inUseNow: license.inUseNow
-    })
-    setLicenseDialogOpen(true)
-  }
-
-  const closeLicenseDialog = () => {
-    setLicenseDialogOpen(false)
-  }
-
   const handleSubmitLicense = async () => {
-    const payload = {
-      name: licenseForm.name,
-      typeCode: licenseForm.typeCode,
-      capTotal: Number(licenseForm.capTotal),
-      inUseNow: Number(licenseForm.inUseNow)
-    }
-    if (licenseDialogMode === 'add') {
-      await api.post('/api/licenses', payload)
-    } else if (editingLicenseId) {
-      await api.patch(`/api/licenses/${editingLicenseId}`, payload)
-    }
-    setLicenseDialogOpen(false)
-    await load()
+    const payload = { name: licenseForm.name, typeCode: licenseForm.typeCode, capTotal: Number(licenseForm.capTotal), inUseNow: Number(licenseForm.inUseNow) }
+    if (licenseDialogMode === 'add') await api.post('/api/licenses', payload)
+    else if (editingLicenseId) await api.patch(`/api/licenses/${editingLicenseId}`, payload)
+    setLicenseDialogOpen(false); await load()
   }
-
-  const handleDeleteLicense = async (licenseId: string) => {
-    await api.delete(`/api/licenses/${licenseId}`)
-    await load()
-  }
+  const handleDeleteLicense = async (id: string) => { await api.delete(`/api/licenses/${id}`); await load() }
 
   const openAddVehicle = () => {
-    setVehicleDialogMode('add')
-    setEditingVehicleId(null)
-    setVehicleForm({ availableQty: 1 })
-    setVehicleDialogOpen(true)
+    setVehicleDialogMode('add'); setEditingVehicleId(null)
+    setVehicleForm({ availableQty: 1 }); setVehicleDialogOpen(true)
   }
-
-  const openEditVehicle = (vehicle: Vehicle) => {
-    setVehicleDialogMode('edit')
-    setEditingVehicleId(vehicle._id)
-    setVehicleForm({ availableQty: vehicle.availableQty })
-    setVehicleDialogOpen(true)
+  const openEditVehicle = (v: Vehicle) => {
+    setVehicleDialogMode('edit'); setEditingVehicleId(v._id)
+    setVehicleForm({ availableQty: v.availableQty }); setVehicleDialogOpen(true)
   }
-
-  const closeVehicleDialog = () => {
-    setVehicleDialogOpen(false)
-  }
-
   const handleSubmitVehicle = async () => {
     const payload = { availableQty: Number(vehicleForm.availableQty) }
-    if (vehicleDialogMode === 'add') {
-      await api.post('/api/vehicles', payload)
-    } else if (editingVehicleId) {
-      await api.patch(`/api/vehicles/${editingVehicleId}`, payload)
-    }
-    setVehicleDialogOpen(false)
-    await load()
+    if (vehicleDialogMode === 'add') await api.post('/api/vehicles', payload)
+    else if (editingVehicleId) await api.patch(`/api/vehicles/${editingVehicleId}`, payload)
+    setVehicleDialogOpen(false); await load()
   }
-
-  const handleDeleteVehicle = async (vehicleId: string) => {
-    await api.delete(`/api/vehicles/${vehicleId}`)
-    await load()
-  }
-
+  const handleDeleteVehicle = async (id: string) => { await api.delete(`/api/vehicles/${id}`); await load() }
 
   const handleSaveIncidentConfig = async (incidentId: string) => {
     await api.patch(`/api/incidents/${incidentId}`, {
       priority: Number(incidentPriorityEdits[incidentId] ?? 1),
-      modeFeas: {
-        R: Boolean(incidentModeREdits[incidentId]),
-        O: Boolean(incidentModeOEdits[incidentId])
-      }
+      modeFeas: { R: Boolean(incidentModeREdits[incidentId]), O: Boolean(incidentModeOEdits[incidentId]) }
     })
     await load()
   }
 
   const openRequirementsDialog = (incident: Incident) => {
-    const req = incident.requirements || {
-      requiredSkills: [],
-      requiredToolsByMode: { R: [], O: [] },
-      requiredLicensesByMode: { R: [], O: [] },
-      requiresVehicleIfOnsite: false
-    }
+    const req = incident.requirements || { requiredSkills: [], requiredToolsByMode: { R: [], O: [] }, requiredLicensesByMode: { R: [], O: [] }, requiresVehicleIfOnsite: false }
     setRequirementsIncidentId(incident._id)
     setRequirementsForm({
-      requiredSkills: req.requiredSkills || [],
-      toolsR: req.requiredToolsByMode?.R || [],
-      toolsO: req.requiredToolsByMode?.O || [],
-      licensesR: req.requiredLicensesByMode?.R || [],
-      licensesO: req.requiredLicensesByMode?.O || [],
-      requiresVehicleIfOnsite: Boolean(req.requiresVehicleIfOnsite)
+      requiredSkills: req.requiredSkills || [], toolsR: req.requiredToolsByMode?.R || [],
+      toolsO: req.requiredToolsByMode?.O || [], licensesR: req.requiredLicensesByMode?.R || [],
+      licensesO: req.requiredLicensesByMode?.O || [], requiresVehicleIfOnsite: Boolean(req.requiresVehicleIfOnsite)
     })
     setRequirementsDialogOpen(true)
   }
 
   const handleSaveRequirements = async () => {
-    if (!requirementsIncidentId) {
-      return
-    }
+    if (!requirementsIncidentId) return
     await api.patch(`/api/incidents/${requirementsIncidentId}`, {
       requirements: {
         requiredSkills: requirementsForm.requiredSkills,
-        requiredToolsByMode: {
-          R: requirementsForm.toolsR,
-          O: requirementsForm.toolsO
-        },
-        requiredLicensesByMode: {
-          R: requirementsForm.licensesR,
-          O: requirementsForm.licensesO
-        },
+        requiredToolsByMode: { R: requirementsForm.toolsR, O: requirementsForm.toolsO },
+        requiredLicensesByMode: { R: requirementsForm.licensesR, O: requirementsForm.licensesO },
         requiresVehicleIfOnsite: requirementsForm.requiresVehicleIfOnsite
       }
     })
-    setRequirementsDialogOpen(false)
-    await load()
+    setRequirementsDialogOpen(false); await load()
   }
 
-  const handleCancelDispatch = async (incidentId: string) => {
-    await api.post(`/api/incidents/${incidentId}/cancel`)
-    await load()
-  }
-
-  const toggleIncidentExpand = (incidentId: string) => {
-    setExpandedIncidents((prev) => ({ ...prev, [incidentId]: !prev[incidentId] }))
-  }
-
-  const toggleRunExpand = (runId: string) => {
-    setExpandedRuns((prev) => ({ ...prev, [runId]: !prev[runId] }))
-  }
+  const handleCancelDispatch = async (id: string) => { await api.post(`/api/incidents/${id}/cancel`); await load() }
+  const toggleIncidentExpand = (id: string) => setExpandedIncidents((p) => ({ ...p, [id]: !p[id] }))
+  const toggleRunExpand = (id: string) => setExpandedRuns((p) => ({ ...p, [id]: !p[id] }))
 
   const openAddUnit = () => {
-    setUnitDialogMode('add')
-    setEditingUnitId(null)
+    setUnitDialogMode('add'); setEditingUnitId(null)
+    setUnitForm({ name: '', address: '', lat: '', lng: '', remoteAccessReady: false, isSupportStation: false })
+    setUnitDialogOpen(true)
+  }
+  const openEditUnit = (u: Unit) => {
+    setUnitDialogMode('edit'); setEditingUnitId(u._id)
     setUnitForm({
-      name: '',
-      address: '',
-      lat: '',
-      lng: '',
-      remoteAccessReady: false,
-      isSupportStation: false
+      name: u.name ?? '', address: u.location?.address ?? '',
+      lat: u.location?.lat != null ? String(u.location.lat) : '',
+      lng: u.location?.lng != null ? String(u.location.lng) : '',
+      remoteAccessReady: Boolean(u.remoteAccessReady), isSupportStation: Boolean(u.isSupportStation)
     })
     setUnitDialogOpen(true)
   }
-
-  const openEditUnit = (unit: Unit) => {
-    setUnitDialogMode('edit')
-    setEditingUnitId(unit._id)
-    setUnitForm({
-      name: unit.name ?? '',
-      address: unit.location?.address ?? '',
-      lat: unit.location?.lat != null ? String(unit.location.lat) : '',
-      lng: unit.location?.lng != null ? String(unit.location.lng) : '',
-      remoteAccessReady: Boolean(unit.remoteAccessReady),
-      isSupportStation: Boolean(unit.isSupportStation)
-    })
-    setUnitDialogOpen(true)
-  }
-
-  const closeUnitDialog = () => {
-    setUnitDialogOpen(false)
-  }
-
   const handleSubmitUnit = async () => {
-    const lat = Number(unitForm.lat)
-    const lng = Number(unitForm.lng)
-    if (Number.isNaN(lat) || Number.isNaN(lng)) {
-      return
-    }
-    if (unitForm.isSupportStation && existingStation && existingStation._id !== editingUnitId) {
-      return
-    }
-    const payload = {
-      name: unitForm.name,
-      location: { lat, lng, address: unitForm.address },
-      remoteAccessReady: unitForm.remoteAccessReady,
-      isSupportStation: unitForm.isSupportStation
-    }
-    if (unitDialogMode === 'add') {
-      await api.post(`/api/companies/${user.companyId}/units`, payload)
-    } else if (editingUnitId) {
-      await api.patch(`/api/companies/${user.companyId}/units/${editingUnitId}`, payload)
-    }
-    setUnitDialogOpen(false)
-    await load()
+    const lat = Number(unitForm.lat); const lng = Number(unitForm.lng)
+    if (Number.isNaN(lat) || Number.isNaN(lng)) return
+    if (unitForm.isSupportStation && existingStation && existingStation._id !== editingUnitId) return
+    const payload = { name: unitForm.name, location: { lat, lng, address: unitForm.address }, remoteAccessReady: unitForm.remoteAccessReady, isSupportStation: unitForm.isSupportStation }
+    if (unitDialogMode === 'add') await api.post(`/api/companies/${user.companyId}/units`, payload)
+    else if (editingUnitId) await api.patch(`/api/companies/${user.companyId}/units/${editingUnitId}`, payload)
+    setUnitDialogOpen(false); await load()
   }
-
-  const handleDeleteUnit = async (unitId: string) => {
-    await api.delete(`/api/companies/${user.companyId}/units/${unitId}`)
-    await load()
-  }
+  const handleDeleteUnit = async (id: string) => { await api.delete(`/api/companies/${user.companyId}/units/${id}`); await load() }
 
   const handleSubmitSkill = async () => {
-    if (!skillForm.name.trim()) {
-      return
-    }
-    if (skillDialogMode === 'add') {
-      await api.post('/api/skills', { name: skillForm.name.trim() })
-    } else if (editingSkillId) {
-      await api.patch(`/api/skills/${editingSkillId}`, { name: skillForm.name.trim() })
-    }
-    setSkillDialogOpen(false)
-    await load()
+    if (!skillForm.name.trim()) return
+    if (skillDialogMode === 'add') await api.post('/api/skills', { name: skillForm.name.trim() })
+    else if (editingSkillId) await api.patch(`/api/skills/${editingSkillId}`, { name: skillForm.name.trim() })
+    setSkillDialogOpen(false); await load()
   }
 
-  const parseList = (value: string) =>
-    value
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
+  const parseList = (v: string) => v.split(',').map((s) => s.trim()).filter(Boolean)
 
   const handleSubmitIncidentType = async () => {
     const payload = {
-      code: incidentTypeForm.code,
-      name: incidentTypeForm.name,
+      code: incidentTypeForm.code, name: incidentTypeForm.name,
       defaultPriority: Number(incidentTypeForm.defaultPriority),
       defaultSetupRemote: Number(incidentTypeForm.defaultSetupRemote),
       defaultFeasRemote: Boolean(incidentTypeForm.defaultFeasRemote),
       defaultFeasOnsite: Boolean(incidentTypeForm.defaultFeasOnsite),
       requirements: {
         requiredSkills: incidentTypeForm.requiredSkills,
-        requiredToolsByMode: {
-          R: parseList(incidentTypeForm.toolsR),
-          O: parseList(incidentTypeForm.toolsO)
-        },
-        requiredLicensesByMode: {
-          R: parseList(incidentTypeForm.licensesR),
-          O: parseList(incidentTypeForm.licensesO)
-        },
+        requiredToolsByMode: { R: parseList(incidentTypeForm.toolsR), O: parseList(incidentTypeForm.toolsO) },
+        requiredLicensesByMode: { R: parseList(incidentTypeForm.licensesR), O: parseList(incidentTypeForm.licensesO) },
         requiresVehicleIfOnsite: Boolean(incidentTypeForm.requiresVehicleIfOnsite)
       }
     }
-    if (incidentTypeDialogMode === 'add') {
-      await api.post('/api/incident-types', payload)
-    } else if (editingIncidentTypeId) {
-      await api.patch(`/api/incident-types/${editingIncidentTypeId}`, {
-        name: payload.name,
-        defaultPriority: payload.defaultPriority,
-        defaultSetupRemote: payload.defaultSetupRemote,
-        defaultFeasRemote: payload.defaultFeasRemote,
-        defaultFeasOnsite: payload.defaultFeasOnsite,
-        requirements: payload.requirements
-      })
-    }
-    setIncidentTypeDialogOpen(false)
-    await load()
+    if (incidentTypeDialogMode === 'add') await api.post('/api/incident-types', payload)
+    else if (editingIncidentTypeId) await api.patch(`/api/incident-types/${editingIncidentTypeId}`, {
+      name: payload.name, defaultPriority: payload.defaultPriority, defaultSetupRemote: payload.defaultSetupRemote,
+      defaultFeasRemote: payload.defaultFeasRemote, defaultFeasOnsite: payload.defaultFeasOnsite, requirements: payload.requirements
+    })
+    setIncidentTypeDialogOpen(false); await load()
   }
+
+  const selectedRouteIncident = selectedRouteId ? routableIncidents.find((i) => i._id === selectedRouteId) : null
+  const selectedRouteInfo = selectedRouteId ? (routeLines[selectedRouteId] ?? fallbackLines[selectedRouteId]) : null
+  const mapDefault = getSavedMapState() ?? { center: [16.0, 106.0] as [number, number], zoom: 5 }
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h5">Bảng điều khiển doanh nghiệp</Typography>
-      <Tabs value={mainTab} onChange={(_, value) => setMainTab(value)}>
-        <Tab label="Điều phối" />
-        <Tab label="Quản trị" />
+      <Typography variant="h5">Bang dieu khien doanh nghiep</Typography>
+      <Tabs value={mainTab} onChange={(_, v) => setMainTab(v)}>
+        <Tab label="Dieu phoi" />
+        <Tab label="Quan tri" />
       </Tabs>
 
       {mainTab === 0 && (
@@ -773,24 +666,17 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           <Card>
             <CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Sự cố đang xử lý</Typography>
+                <Typography variant="h6">Su co dang xu ly</Typography>
                 <Typography variant="caption" color="text.secondary">
-                  Hiển thị {Math.min(activeIncidents.length, incidentRowsPerPage)} trên {activeIncidents.length}
+                  Hien thi {Math.min(activeIncidents.length, incidentRowsPerPage)} tren {activeIncidents.length}
                 </Typography>
               </Stack>
               <Table size="small">
                 <TableHead>
                   <TableRow>
-                    <TableCell />
-                    <TableCell>Loại</TableCell>
-                    <TableCell>Thành phần</TableCell>
-                    <TableCell>Trạng thái</TableCell>
-                    <TableCell>Độ ưu tiên</TableCell>
-                    <TableCell>Đơn vị</TableCell>
-                    <TableCell>Tính khả thi (chế độ)</TableCell>
-                    <TableCell>Thời điểm báo cáo</TableCell>
-                    <TableCell>Yêu cầu</TableCell>
-                    <TableCell>Thao tác</TableCell>
+                    <TableCell /><TableCell>Loai</TableCell><TableCell>Thanh phan</TableCell><TableCell>Trang thai</TableCell>
+                    <TableCell>Uu tien</TableCell><TableCell>Don vi</TableCell><TableCell>Tinh kha thi</TableCell>
+                    <TableCell>Thoi diem</TableCell><TableCell>Yeu cau</TableCell><TableCell>Thao tac</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -801,11 +687,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                       <Fragment key={inc._id}>
                         <TableRow>
                           <TableCell>
-                            <IconButton
-                              size="small"
-                              onClick={() => toggleIncidentExpand(inc._id)}
-                              disabled={!isExpandable}
-                            >
+                            <IconButton size="small" onClick={() => toggleIncidentExpand(inc._id)} disabled={!isExpandable}>
                               {expandedIncidents[inc._id] ? <KeyboardArrowUp /> : <KeyboardArrowDown />}
                             </IconButton>
                           </TableCell>
@@ -813,73 +695,40 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                           <TableCell>{componentNameById.get(inc.componentId) || inc.componentId}</TableCell>
                           <TableCell>{statusLabel(inc.status)}</TableCell>
                           <TableCell>
-                            <TextField
-                              type="number"
-                              size="small"
-                              value={incidentPriorityEdits[inc._id] ?? inc.priority}
-                              onChange={(e) =>
-                                setIncidentPriorityEdits((prev) => ({ ...prev, [inc._id]: Number(e.target.value) }))
-                              }
-                              disabled={!isEditable}
-                              sx={{ width: 90 }}
-                            />
+                            <TextField type="number" size="small" value={incidentPriorityEdits[inc._id] ?? inc.priority}
+                              onChange={(e) => setIncidentPriorityEdits((p) => ({ ...p, [inc._id]: Number(e.target.value) }))}
+                              disabled={!isEditable} sx={{ width: 90 }} />
                           </TableCell>
                           <TableCell>{unitNameById.get(inc.unitId) || inc.unitId}</TableCell>
                           <TableCell>
                             <Stack direction="row" spacing={1} alignItems="center">
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={incidentModeREdits[inc._id] ?? inc.modeFeas.R}
-                                    onChange={(e) =>
-                                      setIncidentModeREdits((prev) => ({ ...prev, [inc._id]: e.target.checked }))
-                                    }
-                                    disabled={!isEditable}
-                                    size="small"
-                                  />
-                                }
-                                label="R"
-                              />
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={incidentModeOEdits[inc._id] ?? inc.modeFeas.O}
-                                    onChange={(e) =>
-                                      setIncidentModeOEdits((prev) => ({ ...prev, [inc._id]: e.target.checked }))
-                                    }
-                                    disabled={!isEditable}
-                                    size="small"
-                                  />
-                                }
-                                label="O"
-                              />
+                              <FormControlLabel control={
+                                <Switch checked={incidentModeREdits[inc._id] ?? inc.modeFeas.R}
+                                  onChange={(e) => setIncidentModeREdits((p) => ({ ...p, [inc._id]: e.target.checked }))}
+                                  disabled={!isEditable} size="small" />} label="R" />
+                              <FormControlLabel control={
+                                <Switch checked={incidentModeOEdits[inc._id] ?? inc.modeFeas.O}
+                                  onChange={(e) => setIncidentModeOEdits((p) => ({ ...p, [inc._id]: e.target.checked }))}
+                                  disabled={!isEditable} size="small" />} label="O" />
                             </Stack>
                           </TableCell>
                           <TableCell>{new Date(inc.reportedAt).toLocaleString()}</TableCell>
                           <TableCell>
                             <Typography variant="caption" sx={{ display: 'block' }}>
-                              Kỹ năng: {inc.requirements?.requiredSkills?.length ?? 0} | Công cụ (TX/TC):
+                              Ky nang: {inc.requirements?.requiredSkills?.length ?? 0} | Cong cu (TX/TC):
                               {inc.requirements?.requiredToolsByMode?.R?.length ?? 0}/
-                              {inc.requirements?.requiredToolsByMode?.O?.length ?? 0} | Công cụ phần mềm (TX/TC):
+                              {inc.requirements?.requiredToolsByMode?.O?.length ?? 0} | PM (TX/TC):
                               {inc.requirements?.requiredLicensesByMode?.R?.length ?? 0}/
-                              {inc.requirements?.requiredLicensesByMode?.O?.length ?? 0} | Phương tiện:
-                              {inc.requirements?.requiresVehicleIfOnsite ? 'Có' : 'Không'}
+                              {inc.requirements?.requiredLicensesByMode?.O?.length ?? 0} | PT:
+                              {inc.requirements?.requiresVehicleIfOnsite ? 'Co' : 'Khong'}
                             </Typography>
-                            <Button size="small" onClick={() => openRequirementsDialog(inc)}>
-                              Chỉnh sửa
-                            </Button>
+                            <Button size="small" onClick={() => openRequirementsDialog(inc)}>Chinh sua</Button>
                           </TableCell>
                           <TableCell>
                             {isEditable ? (
-                              <Button size="small" onClick={() => handleSaveIncidentConfig(inc._id)}>
-                                Lưu
-                              </Button>
-                            ) : (
-                              (inc.status === 'DISPATCHED' || inc.status === 'IN_PROGRESS') && (
-                                <Button size="small" color="warning" onClick={() => handleCancelDispatch(inc._id)}>
-                                  Hủy điều phối
-                                </Button>
-                              )
+                              <Button size="small" onClick={() => handleSaveIncidentConfig(inc._id)}>Luu</Button>
+                            ) : (inc.status === 'DISPATCHED' || inc.status === 'IN_PROGRESS') && (
+                              <Button size="small" color="warning" onClick={() => handleCancelDispatch(inc._id)}>Huy</Button>
                             )}
                           </TableCell>
                         </TableRow>
@@ -887,39 +736,23 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                           <TableCell colSpan={10} sx={{ py: 0 }}>
                             <Collapse in={expandedIncidents[inc._id]} timeout="auto" unmountOnExit>
                               <Box sx={{ p: 2, backgroundColor: '#fafafa', borderRadius: 1 }}>
-                                <Typography variant="subtitle2" gutterBottom>
-                                  Nguồn lực đã điều phối
-                                </Typography>
+                                <Typography variant="subtitle2" gutterBottom>Nguon luc da dieu phoi</Typography>
                                 {inc.dispatch ? (
                                   <Table size="small">
-                                    <TableHead>
-                                      <TableRow>
-                                        <TableCell>Kỹ thuật viên</TableCell>
-                                        <TableCell>Chế độ</TableCell>
-                                        <TableCell>Công cụ</TableCell>
-                                        <TableCell>Công cụ phần mềm</TableCell>
-                                        <TableCell>Phương tiện</TableCell>
-                                        <TableCell>Thời gian đến dự kiến (giờ)</TableCell>
-                                      </TableRow>
-                                    </TableHead>
-                                    <TableBody>
-                                      <TableRow>
-                                        <TableCell>
-                                          {techNameById.get(inc.dispatch.assignedTechId) || inc.dispatch.assignedTechId}
-                                        </TableCell>
-                                        <TableCell>{inc.dispatch.mode}</TableCell>
-                                        <TableCell>{inc.dispatch.allocatedTools.join(', ') || 'Không có'}</TableCell>
-                                        <TableCell>{inc.dispatch.allocatedLicenses.join(', ') || 'Không có'}</TableCell>
-                                        <TableCell>{inc.dispatch.vehicleAllocated ? 'Có' : 'Không'}</TableCell>
-                                        <TableCell>{inc.dispatch.timeToRestoreEstimateHours.toFixed(2)}</TableCell>
-                                      </TableRow>
-                                    </TableBody>
+                                    <TableHead><TableRow>
+                                      <TableCell>KTV</TableCell><TableCell>Che do</TableCell><TableCell>Cong cu</TableCell>
+                                      <TableCell>PM</TableCell><TableCell>PT</TableCell><TableCell>TG du kien (h)</TableCell>
+                                    </TableRow></TableHead>
+                                    <TableBody><TableRow>
+                                      <TableCell>{techNameById.get(inc.dispatch.assignedTechId) || inc.dispatch.assignedTechId}</TableCell>
+                                      <TableCell>{inc.dispatch.mode}</TableCell>
+                                      <TableCell>{inc.dispatch.allocatedTools.join(', ') || '-'}</TableCell>
+                                      <TableCell>{inc.dispatch.allocatedLicenses.join(', ') || '-'}</TableCell>
+                                      <TableCell>{inc.dispatch.vehicleAllocated ? 'Co' : '-'}</TableCell>
+                                      <TableCell>{inc.dispatch.timeToRestoreEstimateHours.toFixed(2)}</TableCell>
+                                    </TableRow></TableBody>
                                   </Table>
-                                ) : (
-                                  <Typography variant="caption" color="text.secondary">
-                                    Chưa có điều phối nào được gán.
-                                  </Typography>
-                                )}
+                                ) : <Typography variant="caption" color="text.secondary">Chua co.</Typography>}
                               </Box>
                             </Collapse>
                           </TableCell>
@@ -929,14 +762,8 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                   })}
                 </TableBody>
               </Table>
-              <TablePagination
-                component="div"
-                count={activeIncidents.length}
-                page={incidentPage}
-                onPageChange={(_, newPage) => setIncidentPage(newPage)}
-                rowsPerPage={incidentRowsPerPage}
-                rowsPerPageOptions={[incidentRowsPerPage]}
-              />
+              <TablePagination component="div" count={activeIncidents.length} page={incidentPage}
+                onPageChange={(_, p) => setIncidentPage(p)} rowsPerPage={incidentRowsPerPage} rowsPerPageOptions={[incidentRowsPerPage]} />
             </CardContent>
           </Card>
 
@@ -945,121 +772,71 @@ function CompanyPortal({ user }: CompanyPortalProps) {
               <Stack spacing={2}>
                 <Card>
                   <CardContent>
-                    <Typography variant="h6" gutterBottom>
-                      Nguồn lực
-                    </Typography>
+                    <Typography variant="h6" gutterBottom>Nguon luc</Typography>
                     <Box sx={{ overflowX: 'auto' }}>
                       <Table size="small">
-                        <TableHead>
-                          <TableRow>
-                            <TableCell>Danh mục</TableCell>
-                            <TableCell>Tên</TableCell>
-                            <TableCell>Mã</TableCell>
-                            <TableCell align="right">Khả dụng</TableCell>
-                            <TableCell align="right">Tổng</TableCell>
-                          </TableRow>
-                        </TableHead>
+                        <TableHead><TableRow>
+                          <TableCell>Danh muc</TableCell><TableCell>Ten</TableCell><TableCell>Ma</TableCell>
+                          <TableCell align="right">Kha dung</TableCell><TableCell align="right">Tong</TableCell>
+                        </TableRow></TableHead>
                         <TableBody>
                           <TableRow>
-                            <TableCell>Kỹ thuật viên</TableCell>
-                            <TableCell>Kỹ thuật viên sẵn sàng</TableCell>
-                            <TableCell>-</TableCell>
-                            <TableCell align="right">{availableTechs}</TableCell>
-                            <TableCell align="right">{technicians.length}</TableCell>
+                            <TableCell>KTV</TableCell><TableCell>San sang</TableCell><TableCell>-</TableCell>
+                            <TableCell align="right">{availableTechs}</TableCell><TableCell align="right">{technicians.length}</TableCell>
                           </TableRow>
                           <TableRow>
-                            <TableCell>Phương tiện</TableCell>
-                            <TableCell>Nguồn phương tiện</TableCell>
-                            <TableCell>-</TableCell>
-                            <TableCell align="right">{vehicleQty}</TableCell>
-                            <TableCell align="right">{vehicleQty}</TableCell>
+                            <TableCell>PT</TableCell><TableCell>Phuong tien</TableCell><TableCell>-</TableCell>
+                            <TableCell align="right">{vehicleQty}</TableCell><TableCell align="right">{vehicleQty}</TableCell>
                           </TableRow>
-                          {tools.map((tool) => (
-                            <TableRow key={tool._id}>
-                              <TableCell>Công cụ</TableCell>
-                              <TableCell>{tool.name}</TableCell>
-                              <TableCell>{tool.typeCode}</TableCell>
-                              <TableCell align="right">{tool.availableQty}</TableCell>
-                              <TableCell align="right">-</TableCell>
+                          {tools.map((t) => (
+                            <TableRow key={t._id}>
+                              <TableCell>Cong cu</TableCell><TableCell>{t.name}</TableCell><TableCell>{t.typeCode}</TableCell>
+                              <TableCell align="right">{t.availableQty}</TableCell><TableCell align="right">-</TableCell>
                             </TableRow>
                           ))}
-                          {licenses.map((lic) => (
-                            <TableRow key={lic._id}>
-                              <TableCell>Công cụ phần mềm</TableCell>
-                              <TableCell>{lic.name}</TableCell>
-                              <TableCell>{lic.typeCode}</TableCell>
-                              <TableCell align="right">{lic.capTotal - lic.inUseNow}</TableCell>
-                              <TableCell align="right">{lic.capTotal}</TableCell>
+                          {licenses.map((l) => (
+                            <TableRow key={l._id}>
+                              <TableCell>PM</TableCell><TableCell>{l.name}</TableCell><TableCell>{l.typeCode}</TableCell>
+                              <TableCell align="right">{l.capTotal - l.inUseNow}</TableCell><TableCell align="right">{l.capTotal}</TableCell>
                             </TableRow>
                           ))}
                         </TableBody>
                       </Table>
                     </Box>
                     <Button sx={{ mt: 2 }} variant="contained" onClick={handleOptimize} disabled={optimizing} fullWidth>
-                      Tối ưu điều phối ngay
+                      Toi uu dieu phoi ngay
                     </Button>
                   </CardContent>
                 </Card>
 
                 <Card>
                   <CardContent>
-                    <Typography variant="h6" gutterBottom>
-                      Thống kê sự cố
-                    </Typography>
+                    <Typography variant="h6" gutterBottom>Thong ke su co</Typography>
                     <Stack spacing={1.5}>
-                      {statusBuckets.map((bucket) => {
-                        const count = statusCounts[bucket.key] ?? 0
+                      {statusBuckets.map((b) => {
+                        const count = statusCounts[b.key] ?? 0
                         return (
-                          <Box key={bucket.key} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                            <Typography variant="caption" sx={{ width: 88 }}>
-                              {bucket.label}
-                            </Typography>
+                          <Box key={b.key} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                            <Typography variant="caption" sx={{ width: 88 }}>{b.label}</Typography>
                             <Box sx={{ flex: 1, height: 8, backgroundColor: '#e0e0e0', borderRadius: 4 }}>
-                              <Box
-                                sx={{
-                                  width: `${(count / maxStatusCount) * 100}%`,
-                                  height: '100%',
-                                  backgroundColor: bucket.color,
-                                  borderRadius: 4
-                                }}
-                              />
+                              <Box sx={{ width: `${(count / maxStatusCount) * 100}%`, height: '100%', backgroundColor: b.color, borderRadius: 4 }} />
                             </Box>
-                            <Typography variant="caption" sx={{ width: 20, textAlign: 'right' }}>
-                              {count}
-                            </Typography>
+                            <Typography variant="caption" sx={{ width: 20, textAlign: 'right' }}>{count}</Typography>
                           </Box>
                         )
                       })}
                     </Stack>
-
                     <Divider sx={{ my: 2 }} />
-                    <Typography variant="subtitle2" gutterBottom>
-                      Các loại sự cố nổi bật
-                    </Typography>
+                    <Typography variant="subtitle2" gutterBottom>Loai su co noi bat</Typography>
                     <Stack spacing={1.5}>
-                      {typeData.length === 0 && (
-                        <Typography variant="caption" color="text.secondary">
-                          Chưa ghi nhận sự cố.
-                        </Typography>
-                      )}
-                      {typeData.map(([typeCode, count]) => (
-                        <Box key={typeCode} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          <Typography variant="caption" sx={{ width: 110 }}>
-                            {typeCode}
-                          </Typography>
+                      {typeData.length === 0 && <Typography variant="caption" color="text.secondary">Chua co.</Typography>}
+                      {typeData.map(([tc, count]) => (
+                        <Box key={tc} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Typography variant="caption" sx={{ width: 110 }}>{tc}</Typography>
                           <Box sx={{ flex: 1, height: 8, backgroundColor: '#e0e0e0', borderRadius: 4 }}>
-                            <Box
-                              sx={{
-                                width: `${(count / maxTypeCount) * 100}%`,
-                                height: '100%',
-                                backgroundColor: '#546e7a',
-                                borderRadius: 4
-                              }}
-                            />
+                            <Box sx={{ width: `${(count / maxTypeCount) * 100}%`, height: '100%', backgroundColor: '#546e7a', borderRadius: 4 }} />
                           </Box>
-                          <Typography variant="caption" sx={{ width: 20, textAlign: 'right' }}>
-                            {count}
-                          </Typography>
+                          <Typography variant="caption" sx={{ width: 20, textAlign: 'right' }}>{count}</Typography>
                         </Box>
                       ))}
                     </Stack>
@@ -1067,71 +844,80 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                 </Card>
               </Stack>
             </Grid>
+
             <Grid item xs={12} md={8}>
               <Card sx={{ height: { xs: 420, md: 'calc(100vh - 220px)' }, minHeight: 420 }}>
                 <CardContent sx={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 1 }}>
-                  <Typography variant="h6" gutterBottom>
-                    Bản đồ đơn vị
-                  </Typography>
-                  <Box className="map-shell">
-                    <MapContainer
-                      center={[16.0, 106.0]}
-                      zoom={5}
-                      style={{ height: '100%', width: '100%' }}
-                    >
-                      <TileLayer
-                        attribution={MAP_ATTRIBUTION}
-                        url={MAP_TILE_URL}
-                      />
-                      {stationLocation &&
-                        onsiteDispatches.map((inc) => {
-                          const unit = unitById.get(inc.unitId)
-                          if (!unit?.location) {
-                            return null
-                          }
-                          const route = routeLines[inc._id] ?? [
-                            [stationLocation.lat, stationLocation.lng],
-                            [unit.location.lat, unit.location.lng]
-                          ]
-                          return (
-                            <Polyline
-                              key={`route-${inc._id}`}
-                              positions={route}
-                              color="#1976d2"
-                              weight={3}
-                            >
-                              <Tooltip sticky>
-                                Điều phối tại chỗ: {inc.typeCode} → {unit.name}
-                              </Tooltip>
-                            </Polyline>
-                          )
-                        })}
+                  <Typography variant="h6" gutterBottom>Ban do don vi</Typography>
+                  <Box className="map-shell" sx={{ position: 'relative' }}>
+                    <MapContainer center={mapDefault.center} zoom={mapDefault.zoom} style={{ height: '100%', width: '100%' }}>
+                      <TileLayer attribution={MAP_ATTRIBUTION} url={MAP_TILE_URL} />
+                      <MapStateTracker />
+                      {stationLocation && routableIncidents.map((inc) => {
+                        const unit = unitById.get(inc.unitId)
+                        if (!unit?.location) return null
+                        const info = routeLines[inc._id] ?? fallbackLines[inc._id]
+                        if (!info) return null
+                        const isSelected = selectedRouteId === inc._id
+                        const dispatched = inc._routeType === 'dispatched'
+                        return (
+                          <Polyline key={`route-${inc._id}`} positions={info.coords}
+                            pathOptions={{
+                              color: isSelected ? '#ff9800' : dispatched ? '#1976d2' : '#d32f2f',
+                              weight: isSelected ? 6 : dispatched ? 4 : 3,
+                              dashArray: dispatched ? undefined : '8,6',
+                              opacity: isSelected ? 1 : dispatched ? 0.9 : 0.6
+                            }}
+                            eventHandlers={{ click: () => setSelectedRouteId(inc._id) }}>
+                            <Tooltip sticky>
+                              {dispatched ? `Dieu phoi: ${inc.typeCode}` : `Chua DP: ${inc.typeCode}`} - {unit.name}
+                            </Tooltip>
+                          </Polyline>
+                        )
+                      })}
                       {units.map((unit) => (
                         <Fragment key={unit._id}>
                           {unit.activeIncidents && unit.activeIncidents > 0 && (
-                            <Marker
-                              position={[unit.location.lat, unit.location.lng]}
-                              icon={pulseIcon}
-                              interactive={false}
-                            />
+                            <Marker position={[unit.location.lat, unit.location.lng]} icon={pulseIcon} interactive={false} />
                           )}
-                      <Marker
-                        position={[unit.location.lat, unit.location.lng]}
-                        icon={unit.isSupportStation ? supportStationIcon : DefaultIcon}
-                      >
-                        <Tooltip direction="top" offset={[0, -18]} permanent className="unit-label-tooltip">
-                          {unit.name}
-                        </Tooltip>
-                        <Popup>
-                          <Typography variant="subtitle2">{unit.name}</Typography>
-                          <Typography variant="caption">
-                            Số sự cố đang hoạt động: {unit.activeIncidents ?? 0}
-                          </Typography>
-                        </Popup>
+                          <Marker position={[unit.location.lat, unit.location.lng]}
+                            icon={unit.isSupportStation ? supportStationIcon : DefaultIcon}>
+                            <Tooltip direction="top" offset={[0, -18]} permanent className="unit-label-tooltip">{unit.name}</Tooltip>
+                            <Popup>
+                              <Typography variant="subtitle2">{unit.name}</Typography>
+                              <Typography variant="caption">Su co: {unit.activeIncidents ?? 0}</Typography>
+                            </Popup>
                           </Marker>
                         </Fragment>
                       ))}
                     </MapContainer>
+
+                    {selectedRouteIncident && selectedRouteInfo && (
+                      <Box sx={{
+                        position: 'absolute', top: 10, left: 10, zIndex: 1000,
+                        backgroundColor: 'rgba(255,255,255,0.95)', borderRadius: 2, p: 2,
+                        minWidth: 240, maxWidth: 320, boxShadow: 3
+                      }}>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center">
+                          <Typography variant="subtitle2">Thong tin tuyen duong</Typography>
+                          <IconButton size="small" onClick={() => setSelectedRouteId(null)}>X</IconButton>
+                        </Stack>
+                        <Divider sx={{ my: 1 }} />
+                        <Typography variant="body2">Su co: {selectedRouteIncident.typeCode}</Typography>
+                        <Typography variant="body2">Don vi: {unitNameById.get(selectedRouteIncident.unitId) || selectedRouteIncident.unitId}</Typography>
+                        <Typography variant="body2">Trang thai: {selectedRouteIncident._routeType === 'dispatched' ? 'Da dieu phoi' : 'Chua dieu phoi'}</Typography>
+                        <Typography variant="body2">Khoang cach: {fmtDistance(selectedRouteInfo.distance)}</Typography>
+                        <Typography variant="body2">Thoi gian: {fmtDuration(selectedRouteInfo.duration)}</Typography>
+                        {selectedRouteIncident.dispatch && (
+                          <>
+                            <Divider sx={{ my: 1 }} />
+                            <Typography variant="body2">KTV: {techNameById.get(selectedRouteIncident.dispatch.assignedTechId) || selectedRouteIncident.dispatch.assignedTechId}</Typography>
+                            <Typography variant="body2">Che do: {selectedRouteIncident.dispatch.mode === 'O' ? 'Tai cho' : 'Tu xa'}</Typography>
+                            <Typography variant="body2">TG phuc hoi: {selectedRouteIncident.dispatch.timeToRestoreEstimateHours.toFixed(2)}h</Typography>
+                          </>
+                        )}
+                      </Box>
+                    )}
                   </Box>
                 </CardContent>
               </Card>
@@ -1140,18 +926,11 @@ function CompanyPortal({ user }: CompanyPortalProps) {
 
           <Card>
             <CardContent>
-              <Typography variant="h6" gutterBottom>
-                Lịch sử điều phối
-              </Typography>
+              <Typography variant="h6" gutterBottom>Lich su dieu phoi</Typography>
               <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell />
-                    <TableCell>Thời điểm chạy</TableCell>
-                    <TableCell>Phân công</TableCell>
-                    <TableCell>Mục tiêu</TableCell>
-                  </TableRow>
-                </TableHead>
+                <TableHead><TableRow>
+                  <TableCell /><TableCell>Thoi diem</TableCell><TableCell>Phan cong</TableCell><TableCell>Muc tieu</TableCell>
+                </TableRow></TableHead>
                 <TableBody>
                   {dispatchRuns.map((run) => (
                     <Fragment key={run._id}>
@@ -1163,49 +942,25 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                         </TableCell>
                         <TableCell>{new Date(run.createdAt).toLocaleString()}</TableCell>
                         <TableCell>{run.result.assignments.length}</TableCell>
-                        <TableCell>
-                          Z1={run.result.objectives.Z1} | Z2={run.result.objectives.Z2} | Z3={run.result.objectives.Z3}
-                        </TableCell>
+                        <TableCell>Z1={run.result.objectives.Z1} | Z2={run.result.objectives.Z2} | Z3={run.result.objectives.Z3}</TableCell>
                       </TableRow>
                       <TableRow>
                         <TableCell colSpan={4} sx={{ py: 0 }}>
                           <Collapse in={expandedRuns[run._id]} timeout="auto" unmountOnExit>
                             <Box sx={{ p: 2, backgroundColor: '#fafafa', borderRadius: 1 }}>
-                              <Typography variant="subtitle2" gutterBottom>
-                                Nguồn lực đã điều phối
-                              </Typography>
                               <Table size="small">
-                                <TableHead>
-                                  <TableRow>
-                                    <TableCell>Sự cố</TableCell>
-                                    <TableCell>Đơn vị</TableCell>
-                                    <TableCell>Kỹ thuật viên</TableCell>
-                                    <TableCell>Chế độ</TableCell>
-                                    <TableCell>Công cụ</TableCell>
-                                    <TableCell>Công cụ phần mềm</TableCell>
-                                    <TableCell>Phương tiện</TableCell>
-                                    <TableCell>Thời gian đến dự kiến (giờ)</TableCell>
-                                  </TableRow>
-                                </TableHead>
+                                <TableHead><TableRow>
+                                  <TableCell>Su co</TableCell><TableCell>KTV</TableCell><TableCell>Che do</TableCell><TableCell>TG (h)</TableCell>
+                                </TableRow></TableHead>
                                 <TableBody>
-                                  {run.result.assignments.map((assignment) => {
-                                    const incident = incidentById.get(assignment.incidentId)
-                                    const unit = incident ? unitNameById.get(incident.unitId) : undefined
-                                    return (
-                                      <TableRow key={`${run._id}-${assignment.incidentId}-${assignment.technicianId}`}>
-                                        <TableCell>{incident?.typeCode || assignment.incidentId}</TableCell>
-                                        <TableCell>{unit || incident?.unitId || '-'}</TableCell>
-                                        <TableCell>
-                                          {techNameById.get(assignment.technicianId) || assignment.technicianId}
-                                        </TableCell>
-                                        <TableCell>{assignment.mode}</TableCell>
-                                        <TableCell>{assignment.allocatedTools.join(', ') || 'Không có'}</TableCell>
-                                        <TableCell>{assignment.allocatedLicenses.join(', ') || 'Không có'}</TableCell>
-                                        <TableCell>{assignment.vehicleAllocated ? 'Có' : 'Không'}</TableCell>
-                                        <TableCell>{assignment.timeToRestoreEstimateHours.toFixed(2)}</TableCell>
-                                      </TableRow>
-                                    )
-                                  })}
+                                  {run.result.assignments.map((a, i) => (
+                                    <TableRow key={i}>
+                                      <TableCell>{incidentById.get(a.incidentId)?.typeCode ?? a.incidentId}</TableCell>
+                                      <TableCell>{techNameById.get(a.technicianId) ?? a.technicianId}</TableCell>
+                                      <TableCell>{a.mode}</TableCell>
+                                      <TableCell>{a.timeToRestoreEstimateHours?.toFixed(2) ?? '--'}</TableCell>
+                                    </TableRow>
+                                  ))}
                                 </TableBody>
                               </Table>
                             </Box>
@@ -1222,1109 +977,436 @@ function CompanyPortal({ user }: CompanyPortalProps) {
       )}
 
       {mainTab === 1 && (
-        <Card>
-          <CardContent>
-            <Typography variant="h6" gutterBottom>
-              Quản trị
-            </Typography>
-            <Tabs value={manageTab} onChange={(_, value) => setManageTab(value)} sx={{ mb: 2 }}>
-              <Tab label="Đơn vị" />
-              <Tab label="Kỹ thuật viên" />
-              <Tab label="Nguồn lực" />
-              <Tab label="Kỹ năng" />
-              <Tab label="Loại sự cố" />
-            </Tabs>
+        <Stack spacing={2}>
+          <Tabs value={manageTab} onChange={(_, v) => setManageTab(v)} variant="scrollable">
+            <Tab label="Don vi" /><Tab label="KTV" /><Tab label="Cong cu" /><Tab label="PM" />
+            <Tab label="PT" /><Tab label="Ky nang" /><Tab label="Loai SC" />
+          </Tabs>
 
-            {manageTab === 0 && (
-              <Card variant="outlined">
-                <CardContent>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 2 }}>
-                    <Typography variant="subtitle1">Đơn vị</Typography>
-                    <Button variant="contained" size="small" onClick={openAddUnit}>
-                      Thêm đơn vị
-                    </Button>
-                  </Stack>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Tên</TableCell>
-                        <TableCell>Loại</TableCell>
-                        <TableCell>Địa chỉ</TableCell>
-                        <TableCell>Vĩ độ</TableCell>
-                        <TableCell>Kinh độ</TableCell>
-                        <TableCell>Truy cập từ xa</TableCell>
-                        <TableCell>Thao tác</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {units.map((unit) => (
-                        <TableRow key={unit._id}>
-                          <TableCell>{unit.name}</TableCell>
-                          <TableCell>{unit.isSupportStation ? 'Trạm hỗ trợ' : 'Đơn vị'}</TableCell>
-                          <TableCell>{unit.location?.address || '-'}</TableCell>
-                          <TableCell>{unit.location?.lat}</TableCell>
-                          <TableCell>{unit.location?.lng}</TableCell>
-                          <TableCell>{unit.remoteAccessReady ? 'Có' : 'Không'}</TableCell>
-                          <TableCell>
-                            <Stack direction="row" spacing={1}>
-                              <Button size="small" onClick={() => openEditUnit(unit)}>
-                                Chỉnh sửa
-                              </Button>
-                              <Button size="small" color="error" onClick={() => handleDeleteUnit(unit._id)}>
-                                Xóa
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </CardContent>
-              </Card>
-            )}
+          {manageTab === 0 && (
+            <Card><CardContent>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                <Typography variant="h6">Don vi</Typography>
+                <Button variant="outlined" size="small" onClick={openAddUnit}>Them</Button>
+              </Stack>
+              <Table size="small">
+                <TableHead><TableRow>
+                  <TableCell>Ten</TableCell><TableCell>Dia chi</TableCell><TableCell>Toa do</TableCell>
+                  <TableCell>Remote</TableCell><TableCell>Tram</TableCell><TableCell>Thao tac</TableCell>
+                </TableRow></TableHead>
+                <TableBody>
+                  {units.map((u) => (
+                    <TableRow key={u._id}>
+                      <TableCell>{u.name}</TableCell><TableCell>{u.location?.address}</TableCell>
+                      <TableCell>{u.location?.lat?.toFixed(4)}, {u.location?.lng?.toFixed(4)}</TableCell>
+                      <TableCell>{u.remoteAccessReady ? 'Co' : '-'}</TableCell>
+                      <TableCell>{u.isSupportStation ? 'Co' : ''}</TableCell>
+                      <TableCell>
+                        <Button size="small" onClick={() => openEditUnit(u)}>Sua</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteUnit(u._id)}>Xoa</Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent></Card>
+          )}
 
-            {manageTab === 1 && (
-              <Card variant="outlined">
-                <CardContent>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 2 }}>
-                    <Typography variant="subtitle1">Kỹ thuật viên</Typography>
-                    <Button variant="contained" size="small" onClick={openAddTech} disabled={!stationReady}>
-                      Thêm kỹ thuật viên
-                    </Button>
-                  </Stack>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Tên</TableCell>
-                        <TableCell>Kỹ năng</TableCell>
-                        <TableCell>Sẵn sàng</TableCell>
-                        <TableCell>Vĩ độ cư trú</TableCell>
-                        <TableCell>Kinh độ cư trú</TableCell>
-                        <TableCell>dMatrix</TableCell>
-                        <TableCell>Thao tác</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {technicians.map((tech) => (
-                        <TableRow key={tech._id}>
-                          <TableCell>{tech.name}</TableCell>
-                          <TableCell>{tech.skills.join(', ') || '-'}</TableCell>
-                          <TableCell>{tech.availableNow ? 'Có' : 'Không'}</TableCell>
-                          <TableCell>{stationLocation?.lat ?? tech.homeLocation?.lat ?? '-'}</TableCell>
-                          <TableCell>{stationLocation?.lng ?? tech.homeLocation?.lng ?? '-'}</TableCell>
-                          <TableCell>
-                            <Typography variant="caption" sx={{ display: 'block', maxWidth: 220 }}>
-                              {tech.dMatrix ? JSON.stringify(tech.dMatrix) : '-'}
-                            </Typography>
-                          </TableCell>
-                          <TableCell>
-                            <Stack direction="row" spacing={1}>
-                              <Button size="small" onClick={() => openEditTech(tech)}>
-                                Chỉnh sửa
-                              </Button>
-                              <Button color="error" size="small" onClick={() => handleDeleteTech(tech._id)}>
-                                Xóa
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </CardContent>
-              </Card>
-            )}
+          {manageTab === 1 && (
+            <Card><CardContent>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                <Typography variant="h6">Ky thuat vien</Typography>
+                <Button variant="outlined" size="small" onClick={openAddTech}>Them</Button>
+              </Stack>
+              <Table size="small">
+                <TableHead><TableRow>
+                  <TableCell>Ten</TableCell><TableCell>Ky nang</TableCell><TableCell>San sang</TableCell><TableCell>Thao tac</TableCell>
+                </TableRow></TableHead>
+                <TableBody>
+                  {technicians.map((t) => (
+                    <TableRow key={t._id}>
+                      <TableCell>{t.name}</TableCell><TableCell>{t.skills?.join(', ')}</TableCell>
+                      <TableCell>{t.availableNow ? 'Co' : '-'}</TableCell>
+                      <TableCell>
+                        <Button size="small" onClick={() => openEditTech(t)}>Sua</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteTech(t._id)}>Xoa</Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent></Card>
+          )}
 
-            {manageTab === 2 && (
-              <Card variant="outlined">
-                <CardContent>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                    <Typography variant="subtitle2">Công cụ</Typography>
-                    <Button variant="contained" size="small" onClick={openAddTool}>
-                      Thêm công cụ
-                    </Button>
-                  </Stack>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Tên</TableCell>
-                        <TableCell>Loại</TableCell>
-                        <TableCell>Số lượng khả dụng</TableCell>
-                        <TableCell>Thao tác</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {tools.map((tool) => (
-                        <TableRow key={tool._id}>
-                          <TableCell>{tool.name}</TableCell>
-                          <TableCell>{tool.typeCode}</TableCell>
-                          <TableCell>{tool.availableQty}</TableCell>
-                          <TableCell>
-                            <Stack direction="row" spacing={1}>
-                              <Button size="small" onClick={() => openEditTool(tool)}>
-                                Chỉnh sửa
-                              </Button>
-                              <Button size="small" color="error" onClick={() => handleDeleteTool(tool._id)}>
-                                Xóa
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
+          {manageTab === 2 && (
+            <Card><CardContent>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                <Typography variant="h6">Cong cu</Typography>
+                <Button variant="outlined" size="small" onClick={openAddTool}>Them</Button>
+              </Stack>
+              <Table size="small">
+                <TableHead><TableRow><TableCell>Ten</TableCell><TableCell>Ma</TableCell><TableCell>SL</TableCell><TableCell>Thao tac</TableCell></TableRow></TableHead>
+                <TableBody>
+                  {tools.map((t) => (
+                    <TableRow key={t._id}>
+                      <TableCell>{t.name}</TableCell><TableCell>{t.typeCode}</TableCell><TableCell>{t.availableQty}</TableCell>
+                      <TableCell>
+                        <Button size="small" onClick={() => openEditTool(t)}>Sua</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteTool(t._id)}>Xoa</Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent></Card>
+          )}
 
-                  <Divider sx={{ my: 2 }} />
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                    <Typography variant="subtitle2">Công cụ phần mềm</Typography>
-                    <Button variant="contained" size="small" onClick={openAddLicense}>
-                      Thêm công cụ phần mềm
-                    </Button>
-                  </Stack>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Tên</TableCell>
-                        <TableCell>Loại</TableCell>
-                        <TableCell>Hạn mức</TableCell>
-                        <TableCell>Đang sử dụng</TableCell>
-                        <TableCell>Khả dụng</TableCell>
-                        <TableCell>Thao tác</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {licenses.map((lic) => (
-                        <TableRow key={lic._id}>
-                          <TableCell>{lic.name}</TableCell>
-                          <TableCell>{lic.typeCode}</TableCell>
-                          <TableCell>{lic.capTotal}</TableCell>
-                          <TableCell>{lic.inUseNow}</TableCell>
-                          <TableCell>{lic.capTotal - lic.inUseNow}</TableCell>
-                          <TableCell>
-                            <Stack direction="row" spacing={1}>
-                              <Button size="small" onClick={() => openEditLicense(lic)}>
-                                Chỉnh sửa
-                              </Button>
-                              <Button size="small" color="error" onClick={() => handleDeleteLicense(lic._id)}>
-                                Xóa
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
+          {manageTab === 3 && (
+            <Card><CardContent>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                <Typography variant="h6">Phan mem</Typography>
+                <Button variant="outlined" size="small" onClick={openAddLicense}>Them</Button>
+              </Stack>
+              <Table size="small">
+                <TableHead><TableRow><TableCell>Ten</TableCell><TableCell>Ma</TableCell><TableCell>Tong</TableCell><TableCell>Dang dung</TableCell><TableCell>Thao tac</TableCell></TableRow></TableHead>
+                <TableBody>
+                  {licenses.map((l) => (
+                    <TableRow key={l._id}>
+                      <TableCell>{l.name}</TableCell><TableCell>{l.typeCode}</TableCell><TableCell>{l.capTotal}</TableCell><TableCell>{l.inUseNow}</TableCell>
+                      <TableCell>
+                        <Button size="small" onClick={() => openEditLicense(l)}>Sua</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteLicense(l._id)}>Xoa</Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent></Card>
+          )}
 
-                  <Divider sx={{ my: 2 }} />
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                    <Typography variant="subtitle2">Phương tiện</Typography>
-                    <Button variant="contained" size="small" onClick={openAddVehicle}>
-                      Thêm phương tiện
-                    </Button>
-                  </Stack>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Nguồn</TableCell>
-                        <TableCell>Số lượng khả dụng</TableCell>
-                        <TableCell>Thao tác</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {vehicles.map((veh) => (
-                        <TableRow key={veh._id}>
-                          <TableCell>Nguồn phương tiện</TableCell>
-                          <TableCell>{veh.availableQty}</TableCell>
-                          <TableCell>
-                            <Stack direction="row" spacing={1}>
-                              <Button size="small" onClick={() => openEditVehicle(veh)}>
-                                Chỉnh sửa
-                              </Button>
-                              <Button size="small" color="error" onClick={() => handleDeleteVehicle(veh._id)}>
-                                Xóa
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </CardContent>
-              </Card>
-            )}
+          {manageTab === 4 && (
+            <Card><CardContent>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                <Typography variant="h6">Phuong tien</Typography>
+                <Button variant="outlined" size="small" onClick={openAddVehicle}>Them</Button>
+              </Stack>
+              <Table size="small">
+                <TableHead><TableRow><TableCell>SL</TableCell><TableCell>Thao tac</TableCell></TableRow></TableHead>
+                <TableBody>
+                  {vehicles.map((v) => (
+                    <TableRow key={v._id}>
+                      <TableCell>{v.availableQty}</TableCell>
+                      <TableCell>
+                        <Button size="small" onClick={() => openEditVehicle(v)}>Sua</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteVehicle(v._id)}>Xoa</Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent></Card>
+          )}
 
-            {manageTab === 3 && (
-              <Card variant="outlined">
-                <CardContent>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 2 }}>
-                    <Typography variant="subtitle1">Kỹ năng</Typography>
-                    <Button variant="contained" size="small" onClick={() => {
-                      setSkillDialogMode('add')
-                      setEditingSkillId(null)
-                      setSkillForm({ name: '' })
-                      setSkillDialogOpen(true)
-                    }}>
-                      Thêm kỹ năng
-                    </Button>
-                  </Stack>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Tên</TableCell>
-                        <TableCell>Thao tác</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {skills.map((skill) => (
-                        <TableRow key={skill._id}>
-                          <TableCell>{skill.name}</TableCell>
-                          <TableCell>
-                            <Stack direction="row" spacing={1}>
-                              <Button
-                                size="small"
-                                onClick={() => {
-                                  setSkillDialogMode('edit')
-                                  setEditingSkillId(skill._id)
-                                  setSkillForm({ name: skill.name })
-                                  setSkillDialogOpen(true)
-                                }}
-                              >
-                                Chỉnh sửa
-                              </Button>
-                              <Button
-                                size="small"
-                                color="error"
-                                onClick={async () => {
-                                  await api.delete(`/api/skills/${skill._id}`)
-                                  await load()
-                                }}
-                              >
-                                Xóa
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </CardContent>
-              </Card>
-            )}
+          {manageTab === 5 && (
+            <Card><CardContent>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                <Typography variant="h6">Ky nang</Typography>
+                <Button variant="outlined" size="small" onClick={() => {
+                  setSkillDialogMode('add'); setEditingSkillId(null); setSkillForm({ name: '' }); setSkillDialogOpen(true)
+                }}>Them</Button>
+              </Stack>
+              <Table size="small">
+                <TableHead><TableRow><TableCell>Ten</TableCell><TableCell>Thao tac</TableCell></TableRow></TableHead>
+                <TableBody>
+                  {skills.map((s) => (
+                    <TableRow key={s._id}>
+                      <TableCell>{s.name}</TableCell>
+                      <TableCell>
+                        <Button size="small" onClick={() => {
+                          setSkillDialogMode('edit'); setEditingSkillId(s._id); setSkillForm({ name: s.name }); setSkillDialogOpen(true)
+                        }}>Sua</Button>
+                        <Button size="small" color="error" onClick={async () => { await api.delete(`/api/skills/${s._id}`); await load() }}>Xoa</Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent></Card>
+          )}
 
-            {manageTab === 4 && (
-              <Card variant="outlined">
-                <CardContent>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 2 }}>
-                    <Typography variant="subtitle1">Loại sự cố</Typography>
-                    <Button
-                      variant="contained"
-                      size="small"
-                      onClick={() => {
-                        setIncidentTypeDialogMode('add')
-                        setEditingIncidentTypeId(null)
-                        setIncidentTypeForm({
-                          code: '',
-                          name: '',
-                          defaultPriority: 3,
-                          defaultSetupRemote: 0.5,
-                          defaultFeasRemote: true,
-                          defaultFeasOnsite: true,
-                          requiredSkills: [],
-                          toolsR: '',
-                          toolsO: '',
-                          licensesR: '',
-                          licensesO: '',
-                          requiresVehicleIfOnsite: false
-                        })
-                        setIncidentTypeDialogOpen(true)
-                      }}
-                    >
-                      Thêm loại
-                    </Button>
-                  </Stack>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Mã</TableCell>
-                        <TableCell>Tên</TableCell>
-                        <TableCell>Độ ưu tiên</TableCell>
-                        <TableCell>Khả thi từ xa</TableCell>
-                        <TableCell>Khả thi tại chỗ</TableCell>
-                        <TableCell>Thao tác</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {incidentTypes.map((type) => (
-                        <TableRow key={type._id}>
-                          <TableCell>{type.code}</TableCell>
-                          <TableCell>{type.name}</TableCell>
-                          <TableCell>{type.defaultPriority}</TableCell>
-                          <TableCell>{type.defaultFeasRemote ? 'Có' : 'Không'}</TableCell>
-                          <TableCell>{type.defaultFeasOnsite ? 'Có' : 'Không'}</TableCell>
-                          <TableCell>
-                            <Stack direction="row" spacing={1}>
-                              <Button
-                                size="small"
-                                onClick={() => {
-                                  setIncidentTypeDialogMode('edit')
-                                  setEditingIncidentTypeId(type._id)
-                                  setIncidentTypeForm({
-                                    code: type.code,
-                                    name: type.name,
-                                    defaultPriority: type.defaultPriority,
-                                    defaultSetupRemote: type.defaultSetupRemote,
-                                    defaultFeasRemote: type.defaultFeasRemote,
-                                    defaultFeasOnsite: type.defaultFeasOnsite,
-                                    requiredSkills: type.requirements?.requiredSkills || [],
-                                    toolsR: type.requirements?.requiredToolsByMode?.R?.join(', ') || '',
-                                    toolsO: type.requirements?.requiredToolsByMode?.O?.join(', ') || '',
-                                    licensesR: type.requirements?.requiredLicensesByMode?.R?.join(', ') || '',
-                                    licensesO: type.requirements?.requiredLicensesByMode?.O?.join(', ') || '',
-                                    requiresVehicleIfOnsite: Boolean(type.requirements?.requiresVehicleIfOnsite)
-                                  })
-                                  setIncidentTypeDialogOpen(true)
-                                }}
-                              >
-                                Chỉnh sửa
-                              </Button>
-                              <Button
-                                size="small"
-                                color="error"
-                                onClick={async () => {
-                                  await api.delete(`/api/incident-types/${type._id}`)
-                                  await load()
-                                }}
-                              >
-                                Xóa
-                              </Button>
-                            </Stack>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </CardContent>
-              </Card>
-            )}
-
-          </CardContent>
-        </Card>
+          {manageTab === 6 && (
+            <Card><CardContent>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                <Typography variant="h6">Loai su co</Typography>
+                <Button variant="outlined" size="small" onClick={() => {
+                  setIncidentTypeDialogMode('add'); setEditingIncidentTypeId(null)
+                  setIncidentTypeForm({ code: '', name: '', defaultPriority: 3, defaultSetupRemote: 0.5, defaultFeasRemote: true, defaultFeasOnsite: true, requiredSkills: [], toolsR: '', toolsO: '', licensesR: '', licensesO: '', requiresVehicleIfOnsite: false })
+                  setIncidentTypeDialogOpen(true)
+                }}>Them</Button>
+              </Stack>
+              <Table size="small">
+                <TableHead><TableRow>
+                  <TableCell>Ma</TableCell><TableCell>Ten</TableCell><TableCell>UT</TableCell><TableCell>R</TableCell><TableCell>O</TableCell><TableCell>Thao tac</TableCell>
+                </TableRow></TableHead>
+                <TableBody>
+                  {incidentTypes.map((it) => (
+                    <TableRow key={it._id}>
+                      <TableCell>{it.code}</TableCell><TableCell>{it.name}</TableCell><TableCell>{it.defaultPriority}</TableCell>
+                      <TableCell>{it.defaultFeasRemote ? 'Co' : '-'}</TableCell><TableCell>{it.defaultFeasOnsite ? 'Co' : '-'}</TableCell>
+                      <TableCell>
+                        <Button size="small" onClick={() => {
+                          setIncidentTypeDialogMode('edit'); setEditingIncidentTypeId(it._id)
+                          setIncidentTypeForm({
+                            code: it.code, name: it.name, defaultPriority: it.defaultPriority,
+                            defaultSetupRemote: it.defaultSetupRemote ?? 0.5,
+                            defaultFeasRemote: it.defaultFeasRemote, defaultFeasOnsite: it.defaultFeasOnsite,
+                            requiredSkills: it.requirements?.requiredSkills ?? [],
+                            toolsR: it.requirements?.requiredToolsByMode?.R?.join(', ') ?? '',
+                            toolsO: it.requirements?.requiredToolsByMode?.O?.join(', ') ?? '',
+                            licensesR: it.requirements?.requiredLicensesByMode?.R?.join(', ') ?? '',
+                            licensesO: it.requirements?.requiredLicensesByMode?.O?.join(', ') ?? '',
+                            requiresVehicleIfOnsite: Boolean(it.requirements?.requiresVehicleIfOnsite)
+                          })
+                          setIncidentTypeDialogOpen(true)
+                        }}>Sua</Button>
+                        <Button size="small" color="error" onClick={async () => { await api.delete(`/api/incident-types/${it._id}`); await load() }}>Xoa</Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent></Card>
+          )}
+        </Stack>
       )}
 
-      <Dialog open={unitDialogOpen} onClose={closeUnitDialog} fullWidth maxWidth="sm">
-        <DialogTitle>{unitDialogMode === 'add' ? 'Thêm đơn vị' : 'Chỉnh sửa đơn vị'}</DialogTitle>
+      <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle>Xem truoc ket qua toi uu</DialogTitle>
         <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField
-              label="Tên"
-              value={unitForm.name}
-              onChange={(e) => setUnitForm((prev) => ({ ...prev, name: e.target.value }))}
-              required
-              fullWidth
-            />
-            <TextField
-              label="Địa chỉ"
-              value={unitForm.address}
-              onChange={(e) => setUnitForm((prev) => ({ ...prev, address: e.target.value }))}
-              fullWidth
-            />
-            <Stack direction="row" spacing={1}>
-              <TextField
-                label="Vĩ độ"
-                value={unitForm.lat}
-                onChange={(e) => setUnitForm((prev) => ({ ...prev, lat: e.target.value }))}
-                fullWidth
-              />
-              <TextField
-                label="Kinh độ"
-                value={unitForm.lng}
-                onChange={(e) => setUnitForm((prev) => ({ ...prev, lng: e.target.value }))}
-                fullWidth
-              />
-            </Stack>
-            <UnitLocationPicker
-              lat={unitForm.lat === '' ? null : Number(unitForm.lat)}
-              lng={unitForm.lng === '' ? null : Number(unitForm.lng)}
-              onChange={(lat, lng) =>
-                setUnitForm((prev) => ({ ...prev, lat: lat.toFixed(6), lng: lng.toFixed(6) }))
-              }
-            />
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={unitForm.remoteAccessReady}
-                  onChange={(e) =>
-                    setUnitForm((prev) => ({ ...prev, remoteAccessReady: e.target.checked }))
-                  }
-                />
-              }
-              label="Sẵn sàng truy cập từ xa"
-            />
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={unitForm.isSupportStation}
-                  onChange={(e) =>
-                    setUnitForm((prev) => ({ ...prev, isSupportStation: e.target.checked }))
-                  }
-                  disabled={stationLocked && !unitForm.isSupportStation}
-                />
-              }
-              label="Trạm hỗ trợ"
-            />
-            {stationLocked && !unitForm.isSupportStation && (
-              <Typography variant="caption" color="text.secondary">
-                Trạm hỗ trợ đã được thiết lập là {existingStation?.name}.
+          {previewResult && (
+            <>
+              <Typography variant="body2" sx={{ mb: 1 }}>
+                Z1={previewResult.objectives.Z1} | Z2={previewResult.objectives.Z2} | Z3={previewResult.objectives.Z3}
               </Typography>
-            )}
-            <Stack direction="row" spacing={1}>
-              <Button variant="contained" onClick={handleSubmitUnit}>
-                Lưu
-              </Button>
-              <Button onClick={closeUnitDialog}>Hủy</Button>
-            </Stack>
-          </Stack>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={techDialogOpen} onClose={closeTechDialog} fullWidth maxWidth="md">
-        <DialogTitle>{techDialogMode === 'add' ? 'Thêm kỹ thuật viên' : 'Chỉnh sửa kỹ thuật viên'}</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField
-              label="Tên"
-              value={techForm.name}
-              onChange={(e) => setTechForm((prev) => ({ ...prev, name: e.target.value }))}
-              fullWidth
-              required
-            />
-            <Stack direction="row" spacing={1}>
-              <TextField
-                label="Vĩ độ trạm hỗ trợ"
-                value={stationLocation?.lat ?? ''}
-                fullWidth
-                disabled
-              />
-              <TextField
-                label="Kinh độ trạm hỗ trợ"
-                value={stationLocation?.lng ?? ''}
-                fullWidth
-                disabled
-              />
-            </Stack>
-            <TextField
-              label="Địa chỉ trạm hỗ trợ"
-              value={stationLocation?.address ?? ''}
-              fullWidth
-              disabled
-            />
-            {!stationReady && (
-              <Typography variant="caption" color="error">
-                Vui lòng thiết lập đơn vị trạm hỗ trợ trước khi thêm kỹ thuật viên.
-              </Typography>
-            )}
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={techForm.availableNow}
-                  onChange={(e) => setTechForm((prev) => ({ ...prev, availableNow: e.target.checked }))}
-                />
-              }
-              label="Sẵn sàng hiện tại"
-            />
-            <FormControl fullWidth>
-              <InputLabel id="tech-skills-label">Kỹ năng</InputLabel>
-              <Select
-                labelId="tech-skills-label"
-                multiple
-                value={techForm.skills}
-                label="Kỹ năng"
-                renderValue={(selected) => (selected as string[]).join(', ')}
-                onChange={(event) =>
-                  setTechForm((prev) => ({ ...prev, skills: event.target.value as string[] }))
-                }
-              >
-                {skills.map((skill) => (
-                  <MenuItem key={skill._id} value={skill.name}>
-                    <Checkbox checked={techForm.skills.includes(skill.name)} />
-                    <ListItemText primary={skill.name} />
-                  </MenuItem>
-                ))}
-              </Select>
-            </FormControl>
-            <Typography variant="subtitle2">dMatrix (theo loại sự cố)</Typography>
-            <Stack spacing={1}>
-              {techForm.dMatrixRows.map((row, idx) => (
-                <Stack direction="row" spacing={1} key={`${row.typeCode}-${idx}`}>
-                  <TextField
-                    select
-                    label="Loại sự cố"
-                    value={row.typeCode}
-                    onChange={(e) =>
-                      setTechForm((prev) => ({
-                        ...prev,
-                        dMatrixRows: prev.dMatrixRows.map((r, rIdx) =>
-                          rIdx === idx ? { ...r, typeCode: e.target.value } : r
-                        )
-                      }))
-                    }
-                    fullWidth
-                  >
-                    {incidentTypes.map((type) => (
-                      <MenuItem key={type._id} value={type.code}>
-                        {type.name}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                  <TextField
-                    select
-                    label="Chế độ"
-                    value={row.mode}
-                    onChange={(e) =>
-                      setTechForm((prev) => ({
-                        ...prev,
-                        dMatrixRows: prev.dMatrixRows.map((r, rIdx) =>
-                          rIdx === idx ? { ...r, mode: e.target.value as 'R' | 'O' } : r
-                        )
-                      }))
-                    }
-                    sx={{ width: 120 }}
-                  >
-                    <MenuItem value="R">Từ xa</MenuItem>
-                    <MenuItem value="O">Tại chỗ</MenuItem>
-                  </TextField>
-                  <TextField
-                    label="Thời lượng (giờ)"
-                    type="number"
-                    value={row.durationHours}
-                    onChange={(e) =>
-                      setTechForm((prev) => ({
-                        ...prev,
-                        dMatrixRows: prev.dMatrixRows.map((r, rIdx) =>
-                          rIdx === idx ? { ...r, durationHours: e.target.value } : r
-                        )
-                      }))
-                    }
-                    sx={{ width: 150 }}
-                  />
-                  <Button
-                    size="small"
-                    color="error"
-                    onClick={() =>
-                      setTechForm((prev) => ({
-                        ...prev,
-                        dMatrixRows: prev.dMatrixRows.filter((_, rIdx) => rIdx !== idx)
-                      }))
-                    }
-                  >
-                    Loại bỏ
-                  </Button>
-                </Stack>
-              ))}
-              <Button
-                size="small"
-                onClick={() =>
-                  setTechForm((prev) => ({
-                    ...prev,
-                    dMatrixRows: [...prev.dMatrixRows, { typeCode: '', mode: 'R', durationHours: '' }]
-                  }))
-                }
-              >
-                Thêm dòng dMatrix
-              </Button>
-            </Stack>
-            <Stack direction="row" spacing={1}>
-              <Button variant="contained" onClick={handleSubmitTech} disabled={!stationReady}>
-                Lưu
-              </Button>
-              <Button onClick={closeTechDialog}>Hủy</Button>
-            </Stack>
-          </Stack>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={toolDialogOpen} onClose={closeToolDialog} fullWidth maxWidth="sm">
-        <DialogTitle>{toolDialogMode === 'add' ? 'Thêm công cụ' : 'Chỉnh sửa công cụ'}</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField
-              label="Tên"
-              value={toolForm.name}
-              onChange={(e) => setToolForm((prev) => ({ ...prev, name: e.target.value }))}
-              fullWidth
-            />
-            <TextField
-              label="Mã loại"
-              value={toolForm.typeCode}
-              onChange={(e) => setToolForm((prev) => ({ ...prev, typeCode: e.target.value }))}
-              fullWidth
-            />
-            <TextField
-              label="Số lượng khả dụng"
-              type="number"
-              value={toolForm.availableQty}
-              onChange={(e) => setToolForm((prev) => ({ ...prev, availableQty: Number(e.target.value) }))}
-              fullWidth
-            />
-            <Stack direction="row" spacing={1}>
-              <Button variant="contained" onClick={handleSubmitTool}>
-                Lưu
-              </Button>
-              <Button onClick={closeToolDialog}>Hủy</Button>
-            </Stack>
-          </Stack>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={licenseDialogOpen} onClose={closeLicenseDialog} fullWidth maxWidth="sm">
-        <DialogTitle>
-          {licenseDialogMode === 'add' ? 'Thêm công cụ phần mềm' : 'Chỉnh sửa công cụ phần mềm'}
-        </DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField
-              label="Tên"
-              value={licenseForm.name}
-              onChange={(e) => setLicenseForm((prev) => ({ ...prev, name: e.target.value }))}
-              fullWidth
-            />
-            <TextField
-              label="Mã loại"
-              value={licenseForm.typeCode}
-              onChange={(e) => setLicenseForm((prev) => ({ ...prev, typeCode: e.target.value }))}
-              fullWidth
-            />
-            <Stack direction="row" spacing={1}>
-              <TextField
-                label="Tổng hạn mức"
-                type="number"
-                value={licenseForm.capTotal}
-                onChange={(e) => setLicenseForm((prev) => ({ ...prev, capTotal: Number(e.target.value) }))}
-                fullWidth
-              />
-              <TextField
-                label="Đang sử dụng"
-                type="number"
-                value={licenseForm.inUseNow}
-                onChange={(e) => setLicenseForm((prev) => ({ ...prev, inUseNow: Number(e.target.value) }))}
-                fullWidth
-              />
-            </Stack>
-            <Stack direction="row" spacing={1}>
-              <Button variant="contained" onClick={handleSubmitLicense}>
-                Lưu
-              </Button>
-              <Button onClick={closeLicenseDialog}>Hủy</Button>
-            </Stack>
-          </Stack>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={vehicleDialogOpen} onClose={closeVehicleDialog} fullWidth maxWidth="sm">
-        <DialogTitle>{vehicleDialogMode === 'add' ? 'Thêm phương tiện' : 'Chỉnh sửa phương tiện'}</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField
-              label="Số lượng khả dụng"
-              type="number"
-              value={vehicleForm.availableQty}
-              onChange={(e) => setVehicleForm({ availableQty: Number(e.target.value) })}
-              fullWidth
-            />
-            <Stack direction="row" spacing={1}>
-              <Button variant="contained" onClick={handleSubmitVehicle}>
-                Lưu
-              </Button>
-              <Button onClick={closeVehicleDialog}>Hủy</Button>
-            </Stack>
-          </Stack>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={skillDialogOpen} onClose={() => setSkillDialogOpen(false)} fullWidth maxWidth="sm">
-        <DialogTitle>{skillDialogMode === 'add' ? 'Thêm kỹ năng' : 'Chỉnh sửa kỹ năng'}</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField
-              label="Tên kỹ năng"
-              value={skillForm.name}
-              onChange={(e) => setSkillForm({ name: e.target.value })}
-              fullWidth
-            />
-            <Stack direction="row" spacing={1}>
-              <Button variant="contained" onClick={handleSubmitSkill}>
-                Lưu
-              </Button>
-              <Button onClick={() => setSkillDialogOpen(false)}>Hủy</Button>
-            </Stack>
-          </Stack>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
-        open={requirementsDialogOpen}
-        onClose={() => setRequirementsDialogOpen(false)}
-        fullWidth
-        maxWidth="md"
-      >
-        <DialogTitle>Yêu cầu sự cố</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <FormControl fullWidth>
-              <InputLabel id="req-skills-label">Kỹ năng bắt buộc</InputLabel>
-              <Select
-                labelId="req-skills-label"
-                multiple
-                value={requirementsForm.requiredSkills}
-                label="Kỹ năng bắt buộc"
-                renderValue={(selected) => (selected as string[]).join(', ')}
-                onChange={(event) =>
-                  setRequirementsForm((prev) => ({ ...prev, requiredSkills: event.target.value as string[] }))
-                }
-              >
-                {skills.map((skill) => (
-                  <MenuItem key={skill._id} value={skill.name}>
-                    <Checkbox checked={requirementsForm.requiredSkills.includes(skill.name)} />
-                    <ListItemText primary={skill.name} />
-                  </MenuItem>
-                ))}
-              </Select>
-            </FormControl>
-
-            <Stack direction="row" spacing={1}>
-              <FormControl fullWidth>
-                <InputLabel id="req-tools-r-label">Công cụ (từ xa)</InputLabel>
-                <Select
-                  labelId="req-tools-r-label"
-                  multiple
-                  value={requirementsForm.toolsR}
-                  label="Công cụ (từ xa)"
-                  renderValue={(selected) => (selected as string[]).join(', ')}
-                  onChange={(event) =>
-                    setRequirementsForm((prev) => ({ ...prev, toolsR: event.target.value as string[] }))
-                  }
-                >
-                  {toolTypeOptions.map((tool) => (
-                    <MenuItem key={tool.typeCode} value={tool.typeCode}>
-                      <Checkbox checked={requirementsForm.toolsR.includes(tool.typeCode)} />
-                      <ListItemText primary={`${tool.name} (${tool.typeCode})`} />
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-              <FormControl fullWidth>
-                <InputLabel id="req-tools-o-label">Công cụ (tại chỗ)</InputLabel>
-                <Select
-                  labelId="req-tools-o-label"
-                  multiple
-                  value={requirementsForm.toolsO}
-                  label="Công cụ (tại chỗ)"
-                  renderValue={(selected) => (selected as string[]).join(', ')}
-                  onChange={(event) =>
-                    setRequirementsForm((prev) => ({ ...prev, toolsO: event.target.value as string[] }))
-                  }
-                >
-                  {toolTypeOptions.map((tool) => (
-                    <MenuItem key={tool.typeCode} value={tool.typeCode}>
-                      <Checkbox checked={requirementsForm.toolsO.includes(tool.typeCode)} />
-                      <ListItemText primary={`${tool.name} (${tool.typeCode})`} />
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-            </Stack>
-
-            <Stack direction="row" spacing={1}>
-              <FormControl fullWidth>
-                <InputLabel id="req-licenses-r-label">Công cụ phần mềm (từ xa)</InputLabel>
-                <Select
-                  labelId="req-licenses-r-label"
-                  multiple
-                  value={requirementsForm.licensesR}
-                  label="Công cụ phần mềm (từ xa)"
-                  renderValue={(selected) => (selected as string[]).join(', ')}
-                  onChange={(event) =>
-                    setRequirementsForm((prev) => ({ ...prev, licensesR: event.target.value as string[] }))
-                  }
-                >
-                  {licenseTypeOptions.map((lic) => (
-                    <MenuItem key={lic.typeCode} value={lic.typeCode}>
-                      <Checkbox checked={requirementsForm.licensesR.includes(lic.typeCode)} />
-                      <ListItemText primary={`${lic.name} (${lic.typeCode})`} />
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-              <FormControl fullWidth>
-                <InputLabel id="req-licenses-o-label">Công cụ phần mềm (tại chỗ)</InputLabel>
-                <Select
-                  labelId="req-licenses-o-label"
-                  multiple
-                  value={requirementsForm.licensesO}
-                  label="Công cụ phần mềm (tại chỗ)"
-                  renderValue={(selected) => (selected as string[]).join(', ')}
-                  onChange={(event) =>
-                    setRequirementsForm((prev) => ({ ...prev, licensesO: event.target.value as string[] }))
-                  }
-                >
-                  {licenseTypeOptions.map((lic) => (
-                    <MenuItem key={lic.typeCode} value={lic.typeCode}>
-                      <Checkbox checked={requirementsForm.licensesO.includes(lic.typeCode)} />
-                      <ListItemText primary={`${lic.name} (${lic.typeCode})`} />
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-            </Stack>
-
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={requirementsForm.requiresVehicleIfOnsite}
-                  onChange={(event) =>
-                    setRequirementsForm((prev) => ({ ...prev, requiresVehicleIfOnsite: event.target.checked }))
-                  }
-                />
-              }
-              label="Yêu cầu phương tiện khi tại chỗ"
-            />
-
-            <Stack direction="row" spacing={1}>
-              <Button variant="contained" onClick={handleSaveRequirements}>
-                Lưu
-              </Button>
-              <Button onClick={() => setRequirementsDialogOpen(false)}>Hủy</Button>
-            </Stack>
-          </Stack>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={incidentTypeDialogOpen} onClose={() => setIncidentTypeDialogOpen(false)} fullWidth maxWidth="md">
-        <DialogTitle>
-          {incidentTypeDialogMode === 'add' ? 'Thêm loại sự cố' : 'Chỉnh sửa loại sự cố'}
-        </DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} sx={{ mt: 1 }}>
-            <Stack direction="row" spacing={1}>
-              <TextField
-                label="Mã"
-                value={incidentTypeForm.code}
-                onChange={(e) => setIncidentTypeForm((prev) => ({ ...prev, code: e.target.value }))}
-                fullWidth
-                disabled={incidentTypeDialogMode === 'edit'}
-              />
-              <TextField
-                label="Tên"
-                value={incidentTypeForm.name}
-                onChange={(e) => setIncidentTypeForm((prev) => ({ ...prev, name: e.target.value }))}
-                fullWidth
-              />
-            </Stack>
-            <Stack direction="row" spacing={1}>
-              <TextField
-                label="Độ ưu tiên mặc định"
-                type="number"
-                value={incidentTypeForm.defaultPriority}
-                onChange={(e) =>
-                  setIncidentTypeForm((prev) => ({ ...prev, defaultPriority: Number(e.target.value) }))
-                }
-                fullWidth
-              />
-              <TextField
-                label="Thời gian thiết lập từ xa mặc định (giờ)"
-                type="number"
-                value={incidentTypeForm.defaultSetupRemote}
-                onChange={(e) =>
-                  setIncidentTypeForm((prev) => ({ ...prev, defaultSetupRemote: Number(e.target.value) }))
-                }
-                fullWidth
-              />
-            </Stack>
-            <Stack direction="row" spacing={1}>
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={incidentTypeForm.defaultFeasRemote}
-                    onChange={(e) =>
-                      setIncidentTypeForm((prev) => ({ ...prev, defaultFeasRemote: e.target.checked }))
-                    }
-                  />
-                }
-                label="Khả thi từ xa"
-              />
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={incidentTypeForm.defaultFeasOnsite}
-                    onChange={(e) =>
-                      setIncidentTypeForm((prev) => ({ ...prev, defaultFeasOnsite: e.target.checked }))
-                    }
-                  />
-                }
-                label="Khả thi tại chỗ"
-              />
-            </Stack>
-            <FormControl fullWidth>
-              <InputLabel id="incident-required-skills-label">Kỹ năng bắt buộc</InputLabel>
-              <Select
-                labelId="incident-required-skills-label"
-                multiple
-                value={incidentTypeForm.requiredSkills}
-                label="Kỹ năng bắt buộc"
-                renderValue={(selected) => (selected as string[]).join(', ')}
-                onChange={(event) =>
-                  setIncidentTypeForm((prev) => ({ ...prev, requiredSkills: event.target.value as string[] }))
-                }
-              >
-                {skills.map((skill) => (
-                  <MenuItem key={skill._id} value={skill.name}>
-                    <Checkbox checked={incidentTypeForm.requiredSkills.includes(skill.name)} />
-                    <ListItemText primary={skill.name} />
-                  </MenuItem>
-                ))}
-              </Select>
-            </FormControl>
-            <Stack direction="row" spacing={1}>
-              <TextField
-                label="Công cụ (từ xa)"
-                value={incidentTypeForm.toolsR}
-                onChange={(e) => setIncidentTypeForm((prev) => ({ ...prev, toolsR: e.target.value }))}
-                fullWidth
-              />
-              <TextField
-                label="Công cụ (tại chỗ)"
-                value={incidentTypeForm.toolsO}
-                onChange={(e) => setIncidentTypeForm((prev) => ({ ...prev, toolsO: e.target.value }))}
-                fullWidth
-              />
-            </Stack>
-            <Stack direction="row" spacing={1}>
-              <TextField
-                label="Công cụ phần mềm (từ xa)"
-                value={incidentTypeForm.licensesR}
-                onChange={(e) => setIncidentTypeForm((prev) => ({ ...prev, licensesR: e.target.value }))}
-                fullWidth
-              />
-              <TextField
-                label="Công cụ phần mềm (tại chỗ)"
-                value={incidentTypeForm.licensesO}
-                onChange={(e) => setIncidentTypeForm((prev) => ({ ...prev, licensesO: e.target.value }))}
-                fullWidth
-              />
-            </Stack>
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={incidentTypeForm.requiresVehicleIfOnsite}
-                  onChange={(e) =>
-                    setIncidentTypeForm((prev) => ({ ...prev, requiresVehicleIfOnsite: e.target.checked }))
-                  }
-                />
-              }
-              label="Yêu cầu phương tiện khi tại chỗ"
-            />
-            <Stack direction="row" spacing={1}>
-              <Button variant="contained" onClick={handleSubmitIncidentType}>
-                Lưu
-              </Button>
-              <Button onClick={() => setIncidentTypeDialogOpen(false)}>Hủy</Button>
-            </Stack>
-          </Stack>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={Boolean(result)} onClose={() => setResult(null)} fullWidth maxWidth="md">
-        <DialogTitle>Kết quả tối ưu hóa</DialogTitle>
-        <DialogContent>
-          {result && (
-            <Stack spacing={2}>
-              <Typography variant="body2">
-                Mục tiêu: Z1={result.objectives.Z1}, Z2={result.objectives.Z2}, Z3={result.objectives.Z3}
-              </Typography>
-              <Typography variant="subtitle2">Sự cố đã điều phối</Typography>
-              <Box sx={{ overflowX: 'auto' }}>
+              {previewResult.assignments.length > 0 ? (
                 <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Sự cố</TableCell>
-                      <TableCell>Kỹ thuật viên</TableCell>
-                      <TableCell>Chế độ</TableCell>
-                      <TableCell>Nguồn lực</TableCell>
-                      <TableCell>Thời gian (giờ)</TableCell>
-                    </TableRow>
-                  </TableHead>
+                  <TableHead><TableRow>
+                    <TableCell>Su co</TableCell><TableCell>Don vi</TableCell><TableCell>KTV</TableCell><TableCell>Che do</TableCell>
+                    <TableCell>Cong cu</TableCell><TableCell>PM</TableCell><TableCell>PT</TableCell><TableCell>TG (h)</TableCell>
+                  </TableRow></TableHead>
                   <TableBody>
-                    {result.assignments.map((a) => (
-                      <TableRow key={`${a.incidentId}-${a.technicianId}`}>
-                        <TableCell>{a.incidentId}</TableCell>
-                        <TableCell>{a.technicianId}</TableCell>
-                        <TableCell>{a.mode}</TableCell>
-                        <TableCell>
-                          Công cụ: {a.allocatedTools.join(', ') || 'Không có'} | Công cụ phần mềm: {a.allocatedLicenses.join(', ') || 'Không có'}
-                        </TableCell>
-                        <TableCell>{a.timeToRestoreEstimateHours.toFixed(2)}</TableCell>
-                      </TableRow>
-                    ))}
-                    {result.assignments.length === 0 && (
-                      <TableRow>
-                        <TableCell colSpan={5}>
-                          <Typography variant="caption" color="text.secondary">
-                            Không có sự cố nào được điều phối trong lần chạy này.
-                          </Typography>
-                        </TableCell>
-                      </TableRow>
-                    )}
+                    {previewResult.assignments.map((a, i) => {
+                      const inc = incidentById.get(a.incidentId)
+                      return (
+                        <TableRow key={i}>
+                          <TableCell>{inc?.typeCode ?? a.incidentId}</TableCell>
+                          <TableCell>{inc ? (unitNameById.get(inc.unitId) || inc.unitId) : '--'}</TableCell>
+                          <TableCell>{techNameById.get(a.technicianId) ?? a.technicianId}</TableCell>
+                          <TableCell>{a.mode === 'O' ? 'Tai cho' : 'Tu xa'}</TableCell>
+                          <TableCell>{a.allocatedTools?.join(', ') || '-'}</TableCell>
+                          <TableCell>{a.allocatedLicenses?.join(', ') || '-'}</TableCell>
+                          <TableCell>{a.vehicleAllocated ? 'Co' : '-'}</TableCell>
+                          <TableCell>{a.timeToRestoreEstimateHours?.toFixed(2) ?? '--'}</TableCell>
+                        </TableRow>
+                      )
+                    })}
                   </TableBody>
                 </Table>
-              </Box>
-
-              <Typography variant="subtitle2">Chưa được điều phối</Typography>
-              <Box sx={{ overflowX: 'auto' }}>
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Sự cố</TableCell>
-                      <TableCell>Độ ưu tiên</TableCell>
-                      <TableCell>Lý do</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {(result.unassigned ?? []).map((entry) => (
-                      <TableRow key={`unassigned-${entry.incidentId}`}>
-                        <TableCell>{entry.typeCode || entry.incidentId}</TableCell>
-                        <TableCell>{entry.priority}</TableCell>
-                        <TableCell>
-                          <Stack spacing={0.5}>
-                            {entry.reasons.map((reason, idx) => (
-                              <Typography key={`${entry.incidentId}-reason-${idx}`} variant="caption">
-                                {reason}
-                              </Typography>
-                            ))}
-                          </Stack>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                    {(result.unassigned ?? []).length === 0 && (
-                      <TableRow>
-                        <TableCell colSpan={3}>
-                          <Typography variant="caption" color="text.secondary">
-                            Tất cả các sự cố ứng viên đều đã được điều phối.
-                          </Typography>
-                        </TableCell>
-                      </TableRow>
-                    )}
-                  </TableBody>
-                </Table>
-              </Box>
-
-              <Stack direction="row" justifyContent="flex-end">
-                <Button variant="contained" onClick={() => setResult(null)}>
-                  Xác nhận
-                </Button>
-              </Stack>
-            </Stack>
+              ) : <Typography variant="body2" color="text.secondary">Khong co phan cong.</Typography>}
+              {previewResult.unassigned && previewResult.unassigned.length > 0 && (
+                <Box sx={{ mt: 2 }}>
+                  <Typography variant="subtitle2">Chua phan cong:</Typography>
+                  {previewResult.unassigned.map((u) => (
+                    <Typography key={u.incidentId} variant="body2">
+                      {u.typeCode} (UT:{u.priority}): {u.reasons.join(', ')}
+                    </Typography>
+                  ))}
+                </Box>
+              )}
+            </>
           )}
         </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCancelPreview} color="error">Huy</Button>
+          <Button onClick={handleConfirmDispatch} variant="contained">Xac nhan dieu phoi</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={unitDialogOpen} onClose={() => setUnitDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{unitDialogMode === 'add' ? 'Them don vi' : 'Sua don vi'}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField label="Ten" fullWidth value={unitForm.name} onChange={(e) => setUnitForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Dia chi" fullWidth value={unitForm.address} onChange={(e) => setUnitForm((f) => ({ ...f, address: e.target.value }))} />
+            <Stack direction="row" spacing={2}>
+              <TextField label="Lat" value={unitForm.lat} onChange={(e) => setUnitForm((f) => ({ ...f, lat: e.target.value }))} />
+              <TextField label="Lng" value={unitForm.lng} onChange={(e) => setUnitForm((f) => ({ ...f, lng: e.target.value }))} />
+            </Stack>
+            <UnitLocationPicker lat={unitForm.lat ? Number(unitForm.lat) : null} lng={unitForm.lng ? Number(unitForm.lng) : null}
+              onChange={(lat, lng) => setUnitForm((f) => ({ ...f, lat: String(lat), lng: String(lng) }))} />
+            <FormControlLabel control={<Switch checked={unitForm.remoteAccessReady} onChange={(e) => setUnitForm((f) => ({ ...f, remoteAccessReady: e.target.checked }))} />} label="Remote Access" />
+            <FormControlLabel control={<Switch checked={unitForm.isSupportStation} onChange={(e) => setUnitForm((f) => ({ ...f, isSupportStation: e.target.checked }))} disabled={stationLocked} />} label="Tram ung cuu" />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setUnitDialogOpen(false)}>Huy</Button>
+          <Button variant="contained" onClick={handleSubmitUnit}>Luu</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={techDialogOpen} onClose={() => setTechDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{techDialogMode === 'add' ? 'Them KTV' : 'Sua KTV'}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField label="Ten" fullWidth value={techForm.name} onChange={(e) => setTechForm((f) => ({ ...f, name: e.target.value }))} />
+            <FormControl fullWidth>
+              <InputLabel>Ky nang</InputLabel>
+              <Select multiple value={techForm.skills} onChange={(e) => setTechForm((f) => ({ ...f, skills: e.target.value as string[] }))}
+                renderValue={(sel) => sel.join(', ')}>
+                {skills.map((s) => (
+                  <MenuItem key={s._id} value={s.name}><Checkbox checked={techForm.skills.includes(s.name)} /><ListItemText primary={s.name} /></MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+            <FormControlLabel control={<Switch checked={techForm.availableNow} onChange={(e) => setTechForm((f) => ({ ...f, availableNow: e.target.checked }))} />} label="San sang" />
+            <Typography variant="subtitle2">dMatrix</Typography>
+            {techForm.dMatrixRows.map((row, idx) => (
+              <Stack key={idx} direction="row" spacing={1} alignItems="center">
+                <FormControl sx={{ minWidth: 120 }}>
+                  <InputLabel>Loai</InputLabel>
+                  <Select value={row.typeCode} onChange={(e) => {
+                    const r = [...techForm.dMatrixRows]; r[idx] = { ...r[idx], typeCode: e.target.value as string }; setTechForm((f) => ({ ...f, dMatrixRows: r }))
+                  }}>{incidentTypes.map((it) => <MenuItem key={it._id} value={it.code}>{it.code}</MenuItem>)}</Select>
+                </FormControl>
+                <FormControl sx={{ minWidth: 80 }}>
+                  <InputLabel>Mode</InputLabel>
+                  <Select value={row.mode} onChange={(e) => {
+                    const r = [...techForm.dMatrixRows]; r[idx] = { ...r[idx], mode: e.target.value as 'R' | 'O' }; setTechForm((f) => ({ ...f, dMatrixRows: r }))
+                  }}><MenuItem value="R">R</MenuItem><MenuItem value="O">O</MenuItem></Select>
+                </FormControl>
+                <TextField label="h" type="number" value={row.durationHours} onChange={(e) => {
+                  const r = [...techForm.dMatrixRows]; r[idx] = { ...r[idx], durationHours: e.target.value }; setTechForm((f) => ({ ...f, dMatrixRows: r }))
+                }} sx={{ width: 80 }} />
+                <Button size="small" color="error" onClick={() => {
+                  setTechForm((f) => ({ ...f, dMatrixRows: f.dMatrixRows.filter((_, i) => i !== idx) }))
+                }}>Xoa</Button>
+              </Stack>
+            ))}
+            <Button size="small" onClick={() => setTechForm((f) => ({ ...f, dMatrixRows: [...f.dMatrixRows, { typeCode: '', mode: 'R', durationHours: '' }] }))}>Them dong</Button>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setTechDialogOpen(false)}>Huy</Button>
+          <Button variant="contained" onClick={handleSubmitTech}>Luu</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={toolDialogOpen} onClose={() => setToolDialogOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>{toolDialogMode === 'add' ? 'Them cong cu' : 'Sua cong cu'}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField label="Ten" fullWidth value={toolForm.name} onChange={(e) => setToolForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Ma" fullWidth value={toolForm.typeCode} onChange={(e) => setToolForm((f) => ({ ...f, typeCode: e.target.value }))} />
+            <TextField label="SL" type="number" fullWidth value={toolForm.availableQty} onChange={(e) => setToolForm((f) => ({ ...f, availableQty: Number(e.target.value) }))} />
+          </Stack>
+        </DialogContent>
+        <DialogActions><Button onClick={() => setToolDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitTool}>Luu</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={licenseDialogOpen} onClose={() => setLicenseDialogOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>{licenseDialogMode === 'add' ? 'Them PM' : 'Sua PM'}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField label="Ten" fullWidth value={licenseForm.name} onChange={(e) => setLicenseForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Ma" fullWidth value={licenseForm.typeCode} onChange={(e) => setLicenseForm((f) => ({ ...f, typeCode: e.target.value }))} />
+            <TextField label="Tong" type="number" fullWidth value={licenseForm.capTotal} onChange={(e) => setLicenseForm((f) => ({ ...f, capTotal: Number(e.target.value) }))} />
+            <TextField label="Dang dung" type="number" fullWidth value={licenseForm.inUseNow} onChange={(e) => setLicenseForm((f) => ({ ...f, inUseNow: Number(e.target.value) }))} />
+          </Stack>
+        </DialogContent>
+        <DialogActions><Button onClick={() => setLicenseDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitLicense}>Luu</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={vehicleDialogOpen} onClose={() => setVehicleDialogOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>{vehicleDialogMode === 'add' ? 'Them PT' : 'Sua PT'}</DialogTitle>
+        <DialogContent>
+          <TextField label="SL" type="number" fullWidth value={vehicleForm.availableQty} onChange={(e) => setVehicleForm((f) => ({ ...f, availableQty: Number(e.target.value) }))} sx={{ mt: 1 }} />
+        </DialogContent>
+        <DialogActions><Button onClick={() => setVehicleDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitVehicle}>Luu</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={skillDialogOpen} onClose={() => setSkillDialogOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>{skillDialogMode === 'add' ? 'Them ky nang' : 'Sua ky nang'}</DialogTitle>
+        <DialogContent>
+          <TextField label="Ten" fullWidth value={skillForm.name} onChange={(e) => setSkillForm({ name: e.target.value })} sx={{ mt: 1 }} />
+        </DialogContent>
+        <DialogActions><Button onClick={() => setSkillDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitSkill}>Luu</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={incidentTypeDialogOpen} onClose={() => setIncidentTypeDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{incidentTypeDialogMode === 'add' ? 'Them loai SC' : 'Sua loai SC'}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField label="Ma" fullWidth value={incidentTypeForm.code} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, code: e.target.value }))} disabled={incidentTypeDialogMode === 'edit'} />
+            <TextField label="Ten" fullWidth value={incidentTypeForm.name} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Uu tien" type="number" fullWidth value={incidentTypeForm.defaultPriority} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultPriority: Number(e.target.value) }))} />
+            <TextField label="Setup remote (h)" type="number" fullWidth value={incidentTypeForm.defaultSetupRemote} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultSetupRemote: Number(e.target.value) }))} />
+            <FormControlLabel control={<Switch checked={incidentTypeForm.defaultFeasRemote} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultFeasRemote: e.target.checked }))} />} label="Remote" />
+            <FormControlLabel control={<Switch checked={incidentTypeForm.defaultFeasOnsite} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultFeasOnsite: e.target.checked }))} />} label="Onsite" />
+            <FormControl fullWidth>
+              <InputLabel>Ky nang</InputLabel>
+              <Select multiple value={incidentTypeForm.requiredSkills} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, requiredSkills: e.target.value as string[] }))}
+                renderValue={(sel) => sel.join(', ')}>
+                {skills.map((s) => (<MenuItem key={s._id} value={s.name}><Checkbox checked={incidentTypeForm.requiredSkills.includes(s.name)} /><ListItemText primary={s.name} /></MenuItem>))}
+              </Select>
+            </FormControl>
+            <TextField label="Cong cu (R)" fullWidth value={incidentTypeForm.toolsR} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, toolsR: e.target.value }))} />
+            <TextField label="Cong cu (O)" fullWidth value={incidentTypeForm.toolsO} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, toolsO: e.target.value }))} />
+            <TextField label="PM (R)" fullWidth value={incidentTypeForm.licensesR} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, licensesR: e.target.value }))} />
+            <TextField label="PM (O)" fullWidth value={incidentTypeForm.licensesO} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, licensesO: e.target.value }))} />
+            <FormControlLabel control={<Switch checked={incidentTypeForm.requiresVehicleIfOnsite} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, requiresVehicleIfOnsite: e.target.checked }))} />} label="Can PT (onsite)" />
+          </Stack>
+        </DialogContent>
+        <DialogActions><Button onClick={() => setIncidentTypeDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitIncidentType}>Luu</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={requirementsDialogOpen} onClose={() => setRequirementsDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Yeu cau su co</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <FormControl fullWidth>
+              <InputLabel>Ky nang</InputLabel>
+              <Select multiple value={requirementsForm.requiredSkills} onChange={(e) => setRequirementsForm((f) => ({ ...f, requiredSkills: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
+                {skills.map((s) => (<MenuItem key={s._id} value={s.name}><Checkbox checked={requirementsForm.requiredSkills.includes(s.name)} /><ListItemText primary={s.name} /></MenuItem>))}
+              </Select>
+            </FormControl>
+            <FormControl fullWidth>
+              <InputLabel>Cong cu (R)</InputLabel>
+              <Select multiple value={requirementsForm.toolsR} onChange={(e) => setRequirementsForm((f) => ({ ...f, toolsR: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
+                {toolTypeOptions.map((t) => (<MenuItem key={t.typeCode} value={t.typeCode}><Checkbox checked={requirementsForm.toolsR.includes(t.typeCode)} /><ListItemText primary={t.name} /></MenuItem>))}
+              </Select>
+            </FormControl>
+            <FormControl fullWidth>
+              <InputLabel>Cong cu (O)</InputLabel>
+              <Select multiple value={requirementsForm.toolsO} onChange={(e) => setRequirementsForm((f) => ({ ...f, toolsO: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
+                {toolTypeOptions.map((t) => (<MenuItem key={t.typeCode} value={t.typeCode}><Checkbox checked={requirementsForm.toolsO.includes(t.typeCode)} /><ListItemText primary={t.name} /></MenuItem>))}
+              </Select>
+            </FormControl>
+            <FormControl fullWidth>
+              <InputLabel>PM (R)</InputLabel>
+              <Select multiple value={requirementsForm.licensesR} onChange={(e) => setRequirementsForm((f) => ({ ...f, licensesR: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
+                {licenseTypeOptions.map((l) => (<MenuItem key={l.typeCode} value={l.typeCode}><Checkbox checked={requirementsForm.licensesR.includes(l.typeCode)} /><ListItemText primary={l.name} /></MenuItem>))}
+              </Select>
+            </FormControl>
+            <FormControl fullWidth>
+              <InputLabel>PM (O)</InputLabel>
+              <Select multiple value={requirementsForm.licensesO} onChange={(e) => setRequirementsForm((f) => ({ ...f, licensesO: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
+                {licenseTypeOptions.map((l) => (<MenuItem key={l.typeCode} value={l.typeCode}><Checkbox checked={requirementsForm.licensesO.includes(l.typeCode)} /><ListItemText primary={l.name} /></MenuItem>))}
+              </Select>
+            </FormControl>
+            <FormControlLabel control={<Switch checked={requirementsForm.requiresVehicleIfOnsite} onChange={(e) => setRequirementsForm((f) => ({ ...f, requiresVehicleIfOnsite: e.target.checked }))} />} label="Can PT (onsite)" />
+          </Stack>
+        </DialogContent>
+        <DialogActions><Button onClick={() => setRequirementsDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSaveRequirements}>Luu</Button></DialogActions>
       </Dialog>
     </Stack>
   )
