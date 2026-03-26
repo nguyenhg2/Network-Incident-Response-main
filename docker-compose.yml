@@ -1,6 +1,7 @@
 version: '3.9'
 
 services:
+
   mongo:
     image: mongo:6
     container_name: incident_mongo
@@ -8,6 +9,55 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  osrm-init:
+    image: osrm/osrm-backend:latest
+    container_name: incident_osrm_init
+    volumes:
+      - osrm_data:/data
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      if [ -f /data/vietnam-latest.osrm.datasource_names ]; then
+        echo 'Du lieu OSRM da co san, bo qua buoc chuan bi...';
+        exit 0;
+      fi;
+      echo 'Dang tai du lieu ban do Viet Nam...';
+      apt-get update && apt-get install -y wget;
+      wget -q -O /data/vietnam-latest.osm.pbf https://download.geofabrik.de/asia/vietnam-latest.osm.pbf;
+      echo 'Dang trich xuat du lieu...';
+      osrm-extract -p /opt/car.lua /data/vietnam-latest.osm.pbf;
+      echo 'Dang phan vung...';
+      osrm-partition /data/vietnam-latest.osrm;
+      echo 'Dang tuy chinh...';
+      osrm-customize /data/vietnam-latest.osrm;
+      echo 'Hoan tat! Du lieu OSRM Viet Nam da san sang.';
+      "
+
+  osrm:
+    image: osrm/osrm-backend:latest
+    container_name: incident_osrm
+    ports:
+      - "5000:5000"
+    volumes:
+      - osrm_data:/data
+    command: >
+      osrm-routed --algorithm mld /data/vietnam-latest.osrm
+    depends_on:
+      osrm-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   backend:
     build: ./backend
@@ -20,7 +70,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
 
   frontend:
     build: ./frontend
@@ -35,15 +86,17 @@ services:
   seed:
     build: ./backend
     container_name: incident_seed
-    command: ["/bin/sh", "-c", "sleep 2 && python -m app.seed.seed_data"]
+    command: ["/bin/sh", "-c", "sleep 5 && python -m app.seed.seed_data"]
     environment:
       - MONGODB_URI=mongodb://mongo:27017
       - MONGODB_DB=incident_response
       - JWT_SECRET=dev-secret
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
     profiles:
       - seed
 
 volumes:
   mongo_data:
+  osrm_data:

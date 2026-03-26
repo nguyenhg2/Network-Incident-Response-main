@@ -7,7 +7,7 @@ from app.models.common import ModeFeas, Requirements, IncidentStatus, DispatchIn
 class IncidentBase(BaseModel):
     companyId: str
     unitId: str
-    componentId: str
+    componentId: str | None = None  
     typeCode: str
     priority: int
     status: IncidentStatus
@@ -15,15 +15,19 @@ class IncidentBase(BaseModel):
     modeFeas: ModeFeas
     setupRemote: float
     requirements: Requirements
+    notes: str | None = None  
 
 
 class IncidentCreate(BaseModel):
-    componentId: str
+
+    unitId: str
     typeCode: str
-    # Reporter does not set priority or mode feasibility; admin will adjust later.
+    componentId: str | None = None
+    notes: str | None = None
 
 
 class IncidentUpdate(BaseModel):
+
     status: IncidentStatus | None = None
     priority: int | None = None
     modeFeas: ModeFeas | None = None
@@ -33,6 +37,6 @@ class IncidentUpdate(BaseModel):
 
 class IncidentInDB(IncidentBase):
     id: str = Field(alias="_id")
-    dispatch: DispatchInfo | None = None
+    dispatch: DispatchInfo | None = None 
 
     model_config = {"populate_by_name": True}

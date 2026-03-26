@@ -59,9 +59,15 @@ const MAP_TILE_URL =
   import.meta.env.VITE_MAP_TILES_URL || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
 const MAP_ATTRIBUTION =
   import.meta.env.VITE_MAP_ATTRIBUTION || '&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a>'
+
+
+const _rawRouter = import.meta.env.VITE_ROUTER_URL || ''
 const ROUTER_BASE_URL = (
-  import.meta.env.VITE_ROUTER_URL || 'https://router.project-osrm.org'
+  _rawRouter && !_rawRouter.includes('localhost') && !_rawRouter.includes('127.0.0.1')
+    ? _rawRouter
+    : 'https://router.project-osrm.org'
 ).replace(/\/$/, '')
+
 const MAP_STATE_KEY = 'company_map_state'
 
 const DefaultIcon = L.icon({
@@ -123,6 +129,7 @@ async function fetchOsrmRoute(
     routeCache.set(key, info)
     return info
   } catch {
+    // Fallback: đường thẳng khi không gọi được OSRM
     return { coords: [[fLat, fLng], [tLat, tLng]], distance: null, duration: null }
   }
 }
@@ -136,7 +143,7 @@ function fmtDuration(s: number | null) {
   if (s == null) return '--'
   const h = Math.floor(s / 3600)
   const m = Math.round((s % 3600) / 60)
-  return h > 0 ? `${h}h ${m}m` : `${m} phut`
+  return h > 0 ? `${h}h ${m}p` : `${m} phút`
 }
 
 function getSavedMapState(): { center: [number, number]; zoom: number } | null {
@@ -145,7 +152,7 @@ function getSavedMapState(): { center: [number, number]; zoom: number } | null {
     if (!raw) return null
     const obj = JSON.parse(raw)
     if (Array.isArray(obj.center) && typeof obj.zoom === 'number') return obj
-  } catch { /* ignore */ }
+  } catch { /* bỏ qua */ }
   return null
 }
 
@@ -329,16 +336,16 @@ function CompanyPortal({ user }: CompanyPortalProps) {
   )
 
   const statusLabel = (status: string) => {
-    if (status === 'DISPATCHED' || status === 'IN_PROGRESS' || status === 'DISPATCHING') return 'Dang dieu phoi'
-    if (status === 'OPEN') return 'Mo'
-    if (status === 'RESOLVED') return 'Hoan tat'
+    if (status === 'DISPATCHED' || status === 'IN_PROGRESS' || status === 'DISPATCHING') return 'Đang điều phối'
+    if (status === 'OPEN') return 'Mới báo cáo'
+    if (status === 'RESOLVED') return 'Hoàn thành'
     return status
   }
 
   const statusBuckets = [
-    { key: 'OPEN', label: 'Mo', color: '#0277bd' },
-    { key: 'DISPATCHING', label: 'Dang dieu phoi', color: '#f9a825' },
-    { key: 'RESOLVED', label: 'Hoan tat', color: '#2e7d32' }
+    { key: 'OPEN',       label: 'Mới báo cáo',    color: '#0277bd' },
+    { key: 'DISPATCHING',label: 'Đang điều phối',  color: '#f9a825' },
+    { key: 'RESOLVED',   label: 'Hoàn thành',      color: '#2e7d32' }
   ]
   const rawStatusCounts = incidents.reduce<Record<string, number>>((acc, inc) => {
     acc[inc.status] = (acc[inc.status] ?? 0) + 1; return acc
@@ -392,6 +399,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
 
   useEffect(() => {
     if (!stationLocation || routableIncidents.length === 0) return
+
     const requests = routableIncidents
       .map((inc) => {
         const unit = unitById.get(inc.unitId)
@@ -399,41 +407,40 @@ function CompanyPortal({ user }: CompanyPortalProps) {
         return { incidentId: inc._id, unit }
       })
       .filter(Boolean) as Array<{ incidentId: string; unit: Unit }>
+
     if (requests.length === 0) return
+
     const allCached = requests.every(({ unit }) =>
       routeCache.has(routeCacheKey(stationLocation.lat, stationLocation.lng, unit.location.lat, unit.location.lng))
     )
     if (allCached) {
-      const entries = requests.map(({ incidentId, unit }) => {
-        const info = routeCache.get(routeCacheKey(stationLocation.lat, stationLocation.lng, unit.location.lat, unit.location.lng))!
-        return [incidentId, info] as const
-      })
-      setRouteLines(Object.fromEntries(entries))
+      setRouteLines(Object.fromEntries(
+        requests.map(({ incidentId, unit }) => [
+          incidentId,
+          routeCache.get(routeCacheKey(stationLocation.lat, stationLocation.lng, unit.location.lat, unit.location.lng))!
+        ])
+      ))
       return
     }
+
     let cancelled = false
-    ;(async () => {
-      const entries: [string, RouteInfo][] = []
-      for (const { incidentId, unit } of requests) {
-        if (cancelled) return
-        const key = routeCacheKey(stationLocation.lat, stationLocation.lng, unit.location.lat, unit.location.lng)
-        if (routeCache.has(key)) {
-          entries.push([incidentId, routeCache.get(key)!])
-          continue
-        }
-        const info = await fetchOsrmRoute(
+    Promise.all(
+      requests.map(({ incidentId, unit }) =>
+        fetchOsrmRoute(
           stationLocation.lat, stationLocation.lng,
           unit.location.lat, unit.location.lng
-        )
-        entries.push([incidentId, info])
-        if (!cancelled) setRouteLines((prev) => ({ ...prev, [incidentId]: info }))
-        await new Promise((r) => setTimeout(r, 300))
-      }
+        ).then((info) => [incidentId, info] as const)
+      )
+    ).then((entries) => {
       if (!cancelled) setRouteLines(Object.fromEntries(entries))
-    })()
-    return () => { cancelled = true }
-  }, [stationLocation, routableKey])
+    })
 
+    return () => { cancelled = true }
+  }, [
+    stationLocation?.lat, 
+    stationLocation?.lng,
+    routableKey
+  ])
 
   const handleOptimize = async () => {
     setOptimizing(true)
@@ -456,7 +463,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
     setPreviewOpen(false)
     if (previewResult) {
       for (const a of previewResult.assignments) {
-        try { await api.post(`/api/incidents/${a.incidentId}/cancel`) } catch { /* ignore */ }
+        try { await api.post(`/api/incidents/${a.incidentId}/cancel`) } catch { /* bỏ qua */ }
       }
     }
     setPreviewResult(null)
@@ -655,10 +662,10 @@ function CompanyPortal({ user }: CompanyPortalProps) {
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h5">Bang dieu khien doanh nghiep</Typography>
+      <Typography variant="h5" fontWeight="bold">Bảng điều khiển doanh nghiệp</Typography>
       <Tabs value={mainTab} onChange={(_, v) => setMainTab(v)}>
-        <Tab label="Dieu phoi" />
-        <Tab label="Quan tri" />
+        <Tab label="Điều phối" />
+        <Tab label="Quản trị" />
       </Tabs>
 
       {mainTab === 0 && (
@@ -666,17 +673,24 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           <Card>
             <CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Su co dang xu ly</Typography>
+                <Typography variant="h6">Sự cố đang xử lý</Typography>
                 <Typography variant="caption" color="text.secondary">
-                  Hien thi {Math.min(activeIncidents.length, incidentRowsPerPage)} tren {activeIncidents.length}
+                  Hiển thị {Math.min(activeIncidents.length, incidentRowsPerPage)} / {activeIncidents.length}
                 </Typography>
               </Stack>
               <Table size="small">
                 <TableHead>
                   <TableRow>
-                    <TableCell /><TableCell>Loai</TableCell><TableCell>Thanh phan</TableCell><TableCell>Trang thai</TableCell>
-                    <TableCell>Uu tien</TableCell><TableCell>Don vi</TableCell><TableCell>Tinh kha thi</TableCell>
-                    <TableCell>Thoi diem</TableCell><TableCell>Yeu cau</TableCell><TableCell>Thao tac</TableCell>
+                    <TableCell />
+                    <TableCell>Loại sự cố</TableCell>
+                    <TableCell>Thiết bị</TableCell>
+                    <TableCell>Trạng thái</TableCell>
+                    <TableCell>Ưu tiên</TableCell>
+                    <TableCell>Đơn vị</TableCell>
+                    <TableCell>Khả thi (TX/TC)</TableCell>
+                    <TableCell>Thời điểm</TableCell>
+                    <TableCell>Yêu cầu</TableCell>
+                    <TableCell>Thao tác</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -692,7 +706,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                             </IconButton>
                           </TableCell>
                           <TableCell>{inc.typeCode}</TableCell>
-                          <TableCell>{componentNameById.get(inc.componentId) || inc.componentId}</TableCell>
+                          <TableCell>{componentNameById.get(inc.componentId) || inc.componentId || '–'}</TableCell>
                           <TableCell>{statusLabel(inc.status)}</TableCell>
                           <TableCell>
                             <TextField type="number" size="small" value={incidentPriorityEdits[inc._id] ?? inc.priority}
@@ -705,30 +719,30 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                               <FormControlLabel control={
                                 <Switch checked={incidentModeREdits[inc._id] ?? inc.modeFeas.R}
                                   onChange={(e) => setIncidentModeREdits((p) => ({ ...p, [inc._id]: e.target.checked }))}
-                                  disabled={!isEditable} size="small" />} label="R" />
+                                  disabled={!isEditable} size="small" />} label="Từ xa" />
                               <FormControlLabel control={
                                 <Switch checked={incidentModeOEdits[inc._id] ?? inc.modeFeas.O}
                                   onChange={(e) => setIncidentModeOEdits((p) => ({ ...p, [inc._id]: e.target.checked }))}
-                                  disabled={!isEditable} size="small" />} label="O" />
+                                  disabled={!isEditable} size="small" />} label="Tại chỗ" />
                             </Stack>
                           </TableCell>
-                          <TableCell>{new Date(inc.reportedAt).toLocaleString()}</TableCell>
+                          <TableCell>{new Date(inc.reportedAt).toLocaleString('vi-VN')}</TableCell>
                           <TableCell>
                             <Typography variant="caption" sx={{ display: 'block' }}>
-                              Ky nang: {inc.requirements?.requiredSkills?.length ?? 0} | Cong cu (TX/TC):
+                              Kỹ năng: {inc.requirements?.requiredSkills?.length ?? 0} | Công cụ (TX/TC):&nbsp;
                               {inc.requirements?.requiredToolsByMode?.R?.length ?? 0}/
-                              {inc.requirements?.requiredToolsByMode?.O?.length ?? 0} | PM (TX/TC):
+                              {inc.requirements?.requiredToolsByMode?.O?.length ?? 0} | PM (TX/TC):&nbsp;
                               {inc.requirements?.requiredLicensesByMode?.R?.length ?? 0}/
-                              {inc.requirements?.requiredLicensesByMode?.O?.length ?? 0} | PT:
-                              {inc.requirements?.requiresVehicleIfOnsite ? 'Co' : 'Khong'}
+                              {inc.requirements?.requiredLicensesByMode?.O?.length ?? 0} | PT:&nbsp;
+                              {inc.requirements?.requiresVehicleIfOnsite ? 'Có' : 'Không'}
                             </Typography>
-                            <Button size="small" onClick={() => openRequirementsDialog(inc)}>Chinh sua</Button>
+                            <Button size="small" onClick={() => openRequirementsDialog(inc)}>Chỉnh sửa</Button>
                           </TableCell>
                           <TableCell>
                             {isEditable ? (
-                              <Button size="small" onClick={() => handleSaveIncidentConfig(inc._id)}>Luu</Button>
+                              <Button size="small" onClick={() => handleSaveIncidentConfig(inc._id)}>Lưu</Button>
                             ) : (inc.status === 'DISPATCHED' || inc.status === 'IN_PROGRESS') && (
-                              <Button size="small" color="warning" onClick={() => handleCancelDispatch(inc._id)}>Huy</Button>
+                              <Button size="small" color="warning" onClick={() => handleCancelDispatch(inc._id)}>Huỷ</Button>
                             )}
                           </TableCell>
                         </TableRow>
@@ -736,23 +750,24 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                           <TableCell colSpan={10} sx={{ py: 0 }}>
                             <Collapse in={expandedIncidents[inc._id]} timeout="auto" unmountOnExit>
                               <Box sx={{ p: 2, backgroundColor: '#fafafa', borderRadius: 1 }}>
-                                <Typography variant="subtitle2" gutterBottom>Nguon luc da dieu phoi</Typography>
+                                <Typography variant="subtitle2" gutterBottom>Nguồn lực đã điều phối</Typography>
                                 {inc.dispatch ? (
                                   <Table size="small">
                                     <TableHead><TableRow>
-                                      <TableCell>KTV</TableCell><TableCell>Che do</TableCell><TableCell>Cong cu</TableCell>
-                                      <TableCell>PM</TableCell><TableCell>PT</TableCell><TableCell>TG du kien (h)</TableCell>
+                                      <TableCell>Kỹ thuật viên</TableCell><TableCell>Chế độ</TableCell>
+                                      <TableCell>Công cụ</TableCell><TableCell>Phần mềm</TableCell>
+                                      <TableCell>Phương tiện</TableCell><TableCell>TG dự kiến (h)</TableCell>
                                     </TableRow></TableHead>
                                     <TableBody><TableRow>
                                       <TableCell>{techNameById.get(inc.dispatch.assignedTechId) || inc.dispatch.assignedTechId}</TableCell>
-                                      <TableCell>{inc.dispatch.mode}</TableCell>
-                                      <TableCell>{inc.dispatch.allocatedTools.join(', ') || '-'}</TableCell>
-                                      <TableCell>{inc.dispatch.allocatedLicenses.join(', ') || '-'}</TableCell>
-                                      <TableCell>{inc.dispatch.vehicleAllocated ? 'Co' : '-'}</TableCell>
+                                      <TableCell>{inc.dispatch.mode === 'O' ? 'Tại chỗ' : 'Từ xa'}</TableCell>
+                                      <TableCell>{inc.dispatch.allocatedTools.join(', ') || '–'}</TableCell>
+                                      <TableCell>{inc.dispatch.allocatedLicenses.join(', ') || '–'}</TableCell>
+                                      <TableCell>{inc.dispatch.vehicleAllocated ? 'Có' : '–'}</TableCell>
                                       <TableCell>{inc.dispatch.timeToRestoreEstimateHours.toFixed(2)}</TableCell>
                                     </TableRow></TableBody>
                                   </Table>
-                                ) : <Typography variant="caption" color="text.secondary">Chua co.</Typography>}
+                                ) : <Typography variant="caption" color="text.secondary">Chưa có thông tin điều phối.</Typography>}
                               </Box>
                             </Collapse>
                           </TableCell>
@@ -763,7 +778,8 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                 </TableBody>
               </Table>
               <TablePagination component="div" count={activeIncidents.length} page={incidentPage}
-                onPageChange={(_, p) => setIncidentPage(p)} rowsPerPage={incidentRowsPerPage} rowsPerPageOptions={[incidentRowsPerPage]} />
+                onPageChange={(_, p) => setIncidentPage(p)} rowsPerPage={incidentRowsPerPage} rowsPerPageOptions={[incidentRowsPerPage]}
+                labelDisplayedRows={({ from, to, count }) => `${from}–${to} / ${count}`} />
             </CardContent>
           </Card>
 
@@ -772,31 +788,31 @@ function CompanyPortal({ user }: CompanyPortalProps) {
               <Stack spacing={2}>
                 <Card>
                   <CardContent>
-                    <Typography variant="h6" gutterBottom>Nguon luc</Typography>
+                    <Typography variant="h6" gutterBottom>Nguồn lực</Typography>
                     <Box sx={{ overflowX: 'auto' }}>
                       <Table size="small">
                         <TableHead><TableRow>
-                          <TableCell>Danh muc</TableCell><TableCell>Ten</TableCell><TableCell>Ma</TableCell>
-                          <TableCell align="right">Kha dung</TableCell><TableCell align="right">Tong</TableCell>
+                          <TableCell>Danh mục</TableCell><TableCell>Tên</TableCell><TableCell>Mã</TableCell>
+                          <TableCell align="right">Khả dụng</TableCell><TableCell align="right">Tổng</TableCell>
                         </TableRow></TableHead>
                         <TableBody>
                           <TableRow>
-                            <TableCell>KTV</TableCell><TableCell>San sang</TableCell><TableCell>-</TableCell>
+                            <TableCell>KTV</TableCell><TableCell>Sẵn sàng</TableCell><TableCell>–</TableCell>
                             <TableCell align="right">{availableTechs}</TableCell><TableCell align="right">{technicians.length}</TableCell>
                           </TableRow>
                           <TableRow>
-                            <TableCell>PT</TableCell><TableCell>Phuong tien</TableCell><TableCell>-</TableCell>
+                            <TableCell>Phương tiện</TableCell><TableCell>Xe</TableCell><TableCell>–</TableCell>
                             <TableCell align="right">{vehicleQty}</TableCell><TableCell align="right">{vehicleQty}</TableCell>
                           </TableRow>
                           {tools.map((t) => (
                             <TableRow key={t._id}>
-                              <TableCell>Cong cu</TableCell><TableCell>{t.name}</TableCell><TableCell>{t.typeCode}</TableCell>
-                              <TableCell align="right">{t.availableQty}</TableCell><TableCell align="right">-</TableCell>
+                              <TableCell>Công cụ</TableCell><TableCell>{t.name}</TableCell><TableCell>{t.typeCode}</TableCell>
+                              <TableCell align="right">{t.availableQty}</TableCell><TableCell align="right">–</TableCell>
                             </TableRow>
                           ))}
                           {licenses.map((l) => (
                             <TableRow key={l._id}>
-                              <TableCell>PM</TableCell><TableCell>{l.name}</TableCell><TableCell>{l.typeCode}</TableCell>
+                              <TableCell>Phần mềm</TableCell><TableCell>{l.name}</TableCell><TableCell>{l.typeCode}</TableCell>
                               <TableCell align="right">{l.capTotal - l.inUseNow}</TableCell><TableCell align="right">{l.capTotal}</TableCell>
                             </TableRow>
                           ))}
@@ -804,20 +820,20 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                       </Table>
                     </Box>
                     <Button sx={{ mt: 2 }} variant="contained" onClick={handleOptimize} disabled={optimizing} fullWidth>
-                      Toi uu dieu phoi ngay
+                      {optimizing ? 'Đang tối ưu...' : 'Tối ưu điều phối ngay'}
                     </Button>
                   </CardContent>
                 </Card>
 
                 <Card>
                   <CardContent>
-                    <Typography variant="h6" gutterBottom>Thong ke su co</Typography>
+                    <Typography variant="h6" gutterBottom>Thống kê sự cố</Typography>
                     <Stack spacing={1.5}>
                       {statusBuckets.map((b) => {
                         const count = statusCounts[b.key] ?? 0
                         return (
                           <Box key={b.key} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                            <Typography variant="caption" sx={{ width: 88 }}>{b.label}</Typography>
+                            <Typography variant="caption" sx={{ width: 110 }}>{b.label}</Typography>
                             <Box sx={{ flex: 1, height: 8, backgroundColor: '#e0e0e0', borderRadius: 4 }}>
                               <Box sx={{ width: `${(count / maxStatusCount) * 100}%`, height: '100%', backgroundColor: b.color, borderRadius: 4 }} />
                             </Box>
@@ -827,9 +843,9 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                       })}
                     </Stack>
                     <Divider sx={{ my: 2 }} />
-                    <Typography variant="subtitle2" gutterBottom>Loai su co noi bat</Typography>
+                    <Typography variant="subtitle2" gutterBottom>Loại sự cố nổi bật</Typography>
                     <Stack spacing={1.5}>
-                      {typeData.length === 0 && <Typography variant="caption" color="text.secondary">Chua co.</Typography>}
+                      {typeData.length === 0 && <Typography variant="caption" color="text.secondary">Chưa có dữ liệu.</Typography>}
                       {typeData.map(([tc, count]) => (
                         <Box key={tc} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                           <Typography variant="caption" sx={{ width: 110 }}>{tc}</Typography>
@@ -848,7 +864,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
             <Grid item xs={12} md={8}>
               <Card sx={{ height: { xs: 420, md: 'calc(100vh - 220px)' }, minHeight: 420 }}>
                 <CardContent sx={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 1 }}>
-                  <Typography variant="h6" gutterBottom>Ban do don vi</Typography>
+                  <Typography variant="h6" gutterBottom>Bản đồ đơn vị</Typography>
                   <Box className="map-shell" sx={{ position: 'relative' }}>
                     <MapContainer center={mapDefault.center} zoom={mapDefault.zoom} style={{ height: '100%', width: '100%' }}>
                       <TileLayer attribution={MAP_ATTRIBUTION} url={MAP_TILE_URL} />
@@ -870,7 +886,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                             }}
                             eventHandlers={{ click: () => setSelectedRouteId(inc._id) }}>
                             <Tooltip sticky>
-                              {dispatched ? `Dieu phoi: ${inc.typeCode}` : `Chua DP: ${inc.typeCode}`} - {unit.name}
+                              {dispatched ? `Đã điều phối: ${inc.typeCode}` : `Chưa điều phối: ${inc.typeCode}`} — {unit.name}
                             </Tooltip>
                           </Polyline>
                         )
@@ -885,7 +901,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                             <Tooltip direction="top" offset={[0, -18]} permanent className="unit-label-tooltip">{unit.name}</Tooltip>
                             <Popup>
                               <Typography variant="subtitle2">{unit.name}</Typography>
-                              <Typography variant="caption">Su co: {unit.activeIncidents ?? 0}</Typography>
+                              <Typography variant="caption">Sự cố: {unit.activeIncidents ?? 0}</Typography>
                             </Popup>
                           </Marker>
                         </Fragment>
@@ -899,21 +915,21 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                         minWidth: 240, maxWidth: 320, boxShadow: 3
                       }}>
                         <Stack direction="row" justifyContent="space-between" alignItems="center">
-                          <Typography variant="subtitle2">Thong tin tuyen duong</Typography>
-                          <IconButton size="small" onClick={() => setSelectedRouteId(null)}>X</IconButton>
+                          <Typography variant="subtitle2">Thông tin tuyến đường</Typography>
+                          <IconButton size="small" onClick={() => setSelectedRouteId(null)}>✕</IconButton>
                         </Stack>
                         <Divider sx={{ my: 1 }} />
-                        <Typography variant="body2">Su co: {selectedRouteIncident.typeCode}</Typography>
-                        <Typography variant="body2">Don vi: {unitNameById.get(selectedRouteIncident.unitId) || selectedRouteIncident.unitId}</Typography>
-                        <Typography variant="body2">Trang thai: {selectedRouteIncident._routeType === 'dispatched' ? 'Da dieu phoi' : 'Chua dieu phoi'}</Typography>
-                        <Typography variant="body2">Khoang cach: {fmtDistance(selectedRouteInfo.distance)}</Typography>
-                        <Typography variant="body2">Thoi gian: {fmtDuration(selectedRouteInfo.duration)}</Typography>
+                        <Typography variant="body2">Sự cố: {selectedRouteIncident.typeCode}</Typography>
+                        <Typography variant="body2">Đơn vị: {unitNameById.get(selectedRouteIncident.unitId) || selectedRouteIncident.unitId}</Typography>
+                        <Typography variant="body2">Trạng thái: {selectedRouteIncident._routeType === 'dispatched' ? 'Đã điều phối' : 'Chưa điều phối'}</Typography>
+                        <Typography variant="body2">Khoảng cách: {fmtDistance(selectedRouteInfo.distance)}</Typography>
+                        <Typography variant="body2">Thời gian: {fmtDuration(selectedRouteInfo.duration)}</Typography>
                         {selectedRouteIncident.dispatch && (
                           <>
                             <Divider sx={{ my: 1 }} />
                             <Typography variant="body2">KTV: {techNameById.get(selectedRouteIncident.dispatch.assignedTechId) || selectedRouteIncident.dispatch.assignedTechId}</Typography>
-                            <Typography variant="body2">Che do: {selectedRouteIncident.dispatch.mode === 'O' ? 'Tai cho' : 'Tu xa'}</Typography>
-                            <Typography variant="body2">TG phuc hoi: {selectedRouteIncident.dispatch.timeToRestoreEstimateHours.toFixed(2)}h</Typography>
+                            <Typography variant="body2">Chế độ: {selectedRouteIncident.dispatch.mode === 'O' ? 'Tại chỗ' : 'Từ xa'}</Typography>
+                            <Typography variant="body2">TG phục hồi: {selectedRouteIncident.dispatch.timeToRestoreEstimateHours.toFixed(2)}h</Typography>
                           </>
                         )}
                       </Box>
@@ -926,10 +942,10 @@ function CompanyPortal({ user }: CompanyPortalProps) {
 
           <Card>
             <CardContent>
-              <Typography variant="h6" gutterBottom>Lich su dieu phoi</Typography>
+              <Typography variant="h6" gutterBottom>Lịch sử điều phối</Typography>
               <Table size="small">
                 <TableHead><TableRow>
-                  <TableCell /><TableCell>Thoi diem</TableCell><TableCell>Phan cong</TableCell><TableCell>Muc tieu</TableCell>
+                  <TableCell /><TableCell>Thời điểm</TableCell><TableCell>Số phân công</TableCell><TableCell>Mục tiêu</TableCell>
                 </TableRow></TableHead>
                 <TableBody>
                   {dispatchRuns.map((run) => (
@@ -940,7 +956,7 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                             {expandedRuns[run._id] ? <KeyboardArrowUp /> : <KeyboardArrowDown />}
                           </IconButton>
                         </TableCell>
-                        <TableCell>{new Date(run.createdAt).toLocaleString()}</TableCell>
+                        <TableCell>{new Date(run.createdAt).toLocaleString('vi-VN')}</TableCell>
                         <TableCell>{run.result.assignments.length}</TableCell>
                         <TableCell>Z1={run.result.objectives.Z1} | Z2={run.result.objectives.Z2} | Z3={run.result.objectives.Z3}</TableCell>
                       </TableRow>
@@ -950,14 +966,15 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                             <Box sx={{ p: 2, backgroundColor: '#fafafa', borderRadius: 1 }}>
                               <Table size="small">
                                 <TableHead><TableRow>
-                                  <TableCell>Su co</TableCell><TableCell>KTV</TableCell><TableCell>Che do</TableCell><TableCell>TG (h)</TableCell>
+                                  <TableCell>Sự cố</TableCell><TableCell>Kỹ thuật viên</TableCell>
+                                  <TableCell>Chế độ</TableCell><TableCell>TG dự kiến (h)</TableCell>
                                 </TableRow></TableHead>
                                 <TableBody>
                                   {run.result.assignments.map((a, i) => (
                                     <TableRow key={i}>
                                       <TableCell>{incidentById.get(a.incidentId)?.typeCode ?? a.incidentId}</TableCell>
                                       <TableCell>{techNameById.get(a.technicianId) ?? a.technicianId}</TableCell>
-                                      <TableCell>{a.mode}</TableCell>
+                                      <TableCell>{a.mode === 'O' ? 'Tại chỗ' : 'Từ xa'}</TableCell>
                                       <TableCell>{a.timeToRestoreEstimateHours?.toFixed(2) ?? '--'}</TableCell>
                                     </TableRow>
                                   ))}
@@ -979,31 +996,36 @@ function CompanyPortal({ user }: CompanyPortalProps) {
       {mainTab === 1 && (
         <Stack spacing={2}>
           <Tabs value={manageTab} onChange={(_, v) => setManageTab(v)} variant="scrollable">
-            <Tab label="Don vi" /><Tab label="KTV" /><Tab label="Cong cu" /><Tab label="PM" />
-            <Tab label="PT" /><Tab label="Ky nang" /><Tab label="Loai SC" />
+            <Tab label="Đơn vị" />
+            <Tab label="Kỹ thuật viên" />
+            <Tab label="Công cụ" />
+            <Tab label="Phần mềm" />
+            <Tab label="Phương tiện" />
+            <Tab label="Kỹ năng" />
+            <Tab label="Loại sự cố" />
           </Tabs>
 
           {manageTab === 0 && (
             <Card><CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Don vi</Typography>
-                <Button variant="outlined" size="small" onClick={openAddUnit}>Them</Button>
+                <Typography variant="h6">Đơn vị</Typography>
+                <Button variant="outlined" size="small" onClick={openAddUnit}>Thêm</Button>
               </Stack>
               <Table size="small">
                 <TableHead><TableRow>
-                  <TableCell>Ten</TableCell><TableCell>Dia chi</TableCell><TableCell>Toa do</TableCell>
-                  <TableCell>Remote</TableCell><TableCell>Tram</TableCell><TableCell>Thao tac</TableCell>
+                  <TableCell>Tên</TableCell><TableCell>Địa chỉ</TableCell><TableCell>Toạ độ</TableCell>
+                  <TableCell>Truy cập từ xa</TableCell><TableCell>Trạm ứng cứu</TableCell><TableCell>Thao tác</TableCell>
                 </TableRow></TableHead>
                 <TableBody>
                   {units.map((u) => (
                     <TableRow key={u._id}>
                       <TableCell>{u.name}</TableCell><TableCell>{u.location?.address}</TableCell>
                       <TableCell>{u.location?.lat?.toFixed(4)}, {u.location?.lng?.toFixed(4)}</TableCell>
-                      <TableCell>{u.remoteAccessReady ? 'Co' : '-'}</TableCell>
-                      <TableCell>{u.isSupportStation ? 'Co' : ''}</TableCell>
+                      <TableCell>{u.remoteAccessReady ? 'Có' : '–'}</TableCell>
+                      <TableCell>{u.isSupportStation ? 'Có' : ''}</TableCell>
                       <TableCell>
-                        <Button size="small" onClick={() => openEditUnit(u)}>Sua</Button>
-                        <Button size="small" color="error" onClick={() => handleDeleteUnit(u._id)}>Xoa</Button>
+                        <Button size="small" onClick={() => openEditUnit(u)}>Sửa</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteUnit(u._id)}>Xoá</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1015,21 +1037,21 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           {manageTab === 1 && (
             <Card><CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Ky thuat vien</Typography>
-                <Button variant="outlined" size="small" onClick={openAddTech}>Them</Button>
+                <Typography variant="h6">Kỹ thuật viên</Typography>
+                <Button variant="outlined" size="small" onClick={openAddTech}>Thêm</Button>
               </Stack>
               <Table size="small">
                 <TableHead><TableRow>
-                  <TableCell>Ten</TableCell><TableCell>Ky nang</TableCell><TableCell>San sang</TableCell><TableCell>Thao tac</TableCell>
+                  <TableCell>Tên</TableCell><TableCell>Kỹ năng</TableCell><TableCell>Sẵn sàng</TableCell><TableCell>Thao tác</TableCell>
                 </TableRow></TableHead>
                 <TableBody>
                   {technicians.map((t) => (
                     <TableRow key={t._id}>
                       <TableCell>{t.name}</TableCell><TableCell>{t.skills?.join(', ')}</TableCell>
-                      <TableCell>{t.availableNow ? 'Co' : '-'}</TableCell>
+                      <TableCell>{t.availableNow ? 'Có' : '–'}</TableCell>
                       <TableCell>
-                        <Button size="small" onClick={() => openEditTech(t)}>Sua</Button>
-                        <Button size="small" color="error" onClick={() => handleDeleteTech(t._id)}>Xoa</Button>
+                        <Button size="small" onClick={() => openEditTech(t)}>Sửa</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteTech(t._id)}>Xoá</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1041,18 +1063,18 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           {manageTab === 2 && (
             <Card><CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Cong cu</Typography>
-                <Button variant="outlined" size="small" onClick={openAddTool}>Them</Button>
+                <Typography variant="h6">Công cụ</Typography>
+                <Button variant="outlined" size="small" onClick={openAddTool}>Thêm</Button>
               </Stack>
               <Table size="small">
-                <TableHead><TableRow><TableCell>Ten</TableCell><TableCell>Ma</TableCell><TableCell>SL</TableCell><TableCell>Thao tac</TableCell></TableRow></TableHead>
+                <TableHead><TableRow><TableCell>Tên</TableCell><TableCell>Mã</TableCell><TableCell>Số lượng</TableCell><TableCell>Thao tác</TableCell></TableRow></TableHead>
                 <TableBody>
                   {tools.map((t) => (
                     <TableRow key={t._id}>
                       <TableCell>{t.name}</TableCell><TableCell>{t.typeCode}</TableCell><TableCell>{t.availableQty}</TableCell>
                       <TableCell>
-                        <Button size="small" onClick={() => openEditTool(t)}>Sua</Button>
-                        <Button size="small" color="error" onClick={() => handleDeleteTool(t._id)}>Xoa</Button>
+                        <Button size="small" onClick={() => openEditTool(t)}>Sửa</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteTool(t._id)}>Xoá</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1064,18 +1086,21 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           {manageTab === 3 && (
             <Card><CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Phan mem</Typography>
-                <Button variant="outlined" size="small" onClick={openAddLicense}>Them</Button>
+                <Typography variant="h6">Phần mềm / Bản quyền</Typography>
+                <Button variant="outlined" size="small" onClick={openAddLicense}>Thêm</Button>
               </Stack>
               <Table size="small">
-                <TableHead><TableRow><TableCell>Ten</TableCell><TableCell>Ma</TableCell><TableCell>Tong</TableCell><TableCell>Dang dung</TableCell><TableCell>Thao tac</TableCell></TableRow></TableHead>
+                <TableHead><TableRow>
+                  <TableCell>Tên</TableCell><TableCell>Mã</TableCell><TableCell>Tổng</TableCell><TableCell>Đang dùng</TableCell><TableCell>Thao tác</TableCell>
+                </TableRow></TableHead>
                 <TableBody>
                   {licenses.map((l) => (
                     <TableRow key={l._id}>
-                      <TableCell>{l.name}</TableCell><TableCell>{l.typeCode}</TableCell><TableCell>{l.capTotal}</TableCell><TableCell>{l.inUseNow}</TableCell>
+                      <TableCell>{l.name}</TableCell><TableCell>{l.typeCode}</TableCell>
+                      <TableCell>{l.capTotal}</TableCell><TableCell>{l.inUseNow}</TableCell>
                       <TableCell>
-                        <Button size="small" onClick={() => openEditLicense(l)}>Sua</Button>
-                        <Button size="small" color="error" onClick={() => handleDeleteLicense(l._id)}>Xoa</Button>
+                        <Button size="small" onClick={() => openEditLicense(l)}>Sửa</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteLicense(l._id)}>Xoá</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1087,18 +1112,18 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           {manageTab === 4 && (
             <Card><CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Phuong tien</Typography>
-                <Button variant="outlined" size="small" onClick={openAddVehicle}>Them</Button>
+                <Typography variant="h6">Phương tiện</Typography>
+                <Button variant="outlined" size="small" onClick={openAddVehicle}>Thêm</Button>
               </Stack>
               <Table size="small">
-                <TableHead><TableRow><TableCell>SL</TableCell><TableCell>Thao tac</TableCell></TableRow></TableHead>
+                <TableHead><TableRow><TableCell>Số lượng</TableCell><TableCell>Thao tác</TableCell></TableRow></TableHead>
                 <TableBody>
                   {vehicles.map((v) => (
                     <TableRow key={v._id}>
                       <TableCell>{v.availableQty}</TableCell>
                       <TableCell>
-                        <Button size="small" onClick={() => openEditVehicle(v)}>Sua</Button>
-                        <Button size="small" color="error" onClick={() => handleDeleteVehicle(v._id)}>Xoa</Button>
+                        <Button size="small" onClick={() => openEditVehicle(v)}>Sửa</Button>
+                        <Button size="small" color="error" onClick={() => handleDeleteVehicle(v._id)}>Xoá</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1110,13 +1135,13 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           {manageTab === 5 && (
             <Card><CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Ky nang</Typography>
+                <Typography variant="h6">Kỹ năng</Typography>
                 <Button variant="outlined" size="small" onClick={() => {
                   setSkillDialogMode('add'); setEditingSkillId(null); setSkillForm({ name: '' }); setSkillDialogOpen(true)
-                }}>Them</Button>
+                }}>Thêm</Button>
               </Stack>
               <Table size="small">
-                <TableHead><TableRow><TableCell>Ten</TableCell><TableCell>Thao tac</TableCell></TableRow></TableHead>
+                <TableHead><TableRow><TableCell>Tên</TableCell><TableCell>Thao tác</TableCell></TableRow></TableHead>
                 <TableBody>
                   {skills.map((s) => (
                     <TableRow key={s._id}>
@@ -1124,8 +1149,8 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                       <TableCell>
                         <Button size="small" onClick={() => {
                           setSkillDialogMode('edit'); setEditingSkillId(s._id); setSkillForm({ name: s.name }); setSkillDialogOpen(true)
-                        }}>Sua</Button>
-                        <Button size="small" color="error" onClick={async () => { await api.delete(`/api/skills/${s._id}`); await load() }}>Xoa</Button>
+                        }}>Sửa</Button>
+                        <Button size="small" color="error" onClick={async () => { await api.delete(`/api/skills/${s._id}`); await load() }}>Xoá</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1137,22 +1162,23 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           {manageTab === 6 && (
             <Card><CardContent>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                <Typography variant="h6">Loai su co</Typography>
+                <Typography variant="h6">Loại sự cố</Typography>
                 <Button variant="outlined" size="small" onClick={() => {
                   setIncidentTypeDialogMode('add'); setEditingIncidentTypeId(null)
                   setIncidentTypeForm({ code: '', name: '', defaultPriority: 3, defaultSetupRemote: 0.5, defaultFeasRemote: true, defaultFeasOnsite: true, requiredSkills: [], toolsR: '', toolsO: '', licensesR: '', licensesO: '', requiresVehicleIfOnsite: false })
                   setIncidentTypeDialogOpen(true)
-                }}>Them</Button>
+                }}>Thêm</Button>
               </Stack>
               <Table size="small">
                 <TableHead><TableRow>
-                  <TableCell>Ma</TableCell><TableCell>Ten</TableCell><TableCell>UT</TableCell><TableCell>R</TableCell><TableCell>O</TableCell><TableCell>Thao tac</TableCell>
+                  <TableCell>Mã</TableCell><TableCell>Tên</TableCell><TableCell>Ưu tiên</TableCell>
+                  <TableCell>Từ xa</TableCell><TableCell>Tại chỗ</TableCell><TableCell>Thao tác</TableCell>
                 </TableRow></TableHead>
                 <TableBody>
                   {incidentTypes.map((it) => (
                     <TableRow key={it._id}>
                       <TableCell>{it.code}</TableCell><TableCell>{it.name}</TableCell><TableCell>{it.defaultPriority}</TableCell>
-                      <TableCell>{it.defaultFeasRemote ? 'Co' : '-'}</TableCell><TableCell>{it.defaultFeasOnsite ? 'Co' : '-'}</TableCell>
+                      <TableCell>{it.defaultFeasRemote ? 'Có' : '–'}</TableCell><TableCell>{it.defaultFeasOnsite ? 'Có' : '–'}</TableCell>
                       <TableCell>
                         <Button size="small" onClick={() => {
                           setIncidentTypeDialogMode('edit'); setEditingIncidentTypeId(it._id)
@@ -1168,8 +1194,8 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                             requiresVehicleIfOnsite: Boolean(it.requirements?.requiresVehicleIfOnsite)
                           })
                           setIncidentTypeDialogOpen(true)
-                        }}>Sua</Button>
-                        <Button size="small" color="error" onClick={async () => { await api.delete(`/api/incident-types/${it._id}`); await load() }}>Xoa</Button>
+                        }}>Sửa</Button>
+                        <Button size="small" color="error" onClick={async () => { await api.delete(`/api/incident-types/${it._id}`); await load() }}>Xoá</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1180,8 +1206,9 @@ function CompanyPortal({ user }: CompanyPortalProps) {
         </Stack>
       )}
 
+      {/* Dialog xem trước kết quả tối ưu */}
       <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} maxWidth="md" fullWidth>
-        <DialogTitle>Xem truoc ket qua toi uu</DialogTitle>
+        <DialogTitle>Xem trước kết quả tối ưu hoá</DialogTitle>
         <DialogContent>
           {previewResult && (
             <>
@@ -1191,8 +1218,9 @@ function CompanyPortal({ user }: CompanyPortalProps) {
               {previewResult.assignments.length > 0 ? (
                 <Table size="small">
                   <TableHead><TableRow>
-                    <TableCell>Su co</TableCell><TableCell>Don vi</TableCell><TableCell>KTV</TableCell><TableCell>Che do</TableCell>
-                    <TableCell>Cong cu</TableCell><TableCell>PM</TableCell><TableCell>PT</TableCell><TableCell>TG (h)</TableCell>
+                    <TableCell>Sự cố</TableCell><TableCell>Đơn vị</TableCell><TableCell>Kỹ thuật viên</TableCell>
+                    <TableCell>Chế độ</TableCell><TableCell>Công cụ</TableCell><TableCell>Phần mềm</TableCell>
+                    <TableCell>Phương tiện</TableCell><TableCell>TG dự kiến (h)</TableCell>
                   </TableRow></TableHead>
                   <TableBody>
                     {previewResult.assignments.map((a, i) => {
@@ -1202,20 +1230,20 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                           <TableCell>{inc?.typeCode ?? a.incidentId}</TableCell>
                           <TableCell>{inc ? (unitNameById.get(inc.unitId) || inc.unitId) : '--'}</TableCell>
                           <TableCell>{techNameById.get(a.technicianId) ?? a.technicianId}</TableCell>
-                          <TableCell>{a.mode === 'O' ? 'Tai cho' : 'Tu xa'}</TableCell>
-                          <TableCell>{a.allocatedTools?.join(', ') || '-'}</TableCell>
-                          <TableCell>{a.allocatedLicenses?.join(', ') || '-'}</TableCell>
-                          <TableCell>{a.vehicleAllocated ? 'Co' : '-'}</TableCell>
+                          <TableCell>{a.mode === 'O' ? 'Tại chỗ' : 'Từ xa'}</TableCell>
+                          <TableCell>{a.allocatedTools?.join(', ') || '–'}</TableCell>
+                          <TableCell>{a.allocatedLicenses?.join(', ') || '–'}</TableCell>
+                          <TableCell>{a.vehicleAllocated ? 'Có' : '–'}</TableCell>
                           <TableCell>{a.timeToRestoreEstimateHours?.toFixed(2) ?? '--'}</TableCell>
                         </TableRow>
                       )
                     })}
                   </TableBody>
                 </Table>
-              ) : <Typography variant="body2" color="text.secondary">Khong co phan cong.</Typography>}
+              ) : <Typography variant="body2" color="text.secondary">Không có phân công nào.</Typography>}
               {previewResult.unassigned && previewResult.unassigned.length > 0 && (
                 <Box sx={{ mt: 2 }}>
-                  <Typography variant="subtitle2">Chua phan cong:</Typography>
+                  <Typography variant="subtitle2">Chưa phân công được:</Typography>
                   {previewResult.unassigned.map((u) => (
                     <Typography key={u.incidentId} variant="body2">
                       {u.typeCode} (UT:{u.priority}): {u.reasons.join(', ')}
@@ -1227,40 +1255,42 @@ function CompanyPortal({ user }: CompanyPortalProps) {
           )}
         </DialogContent>
         <DialogActions>
-          <Button onClick={handleCancelPreview} color="error">Huy</Button>
-          <Button onClick={handleConfirmDispatch} variant="contained">Xac nhan dieu phoi</Button>
+          <Button onClick={handleCancelPreview} color="error">Huỷ bỏ</Button>
+          <Button onClick={handleConfirmDispatch} variant="contained">Xác nhận điều phối</Button>
         </DialogActions>
       </Dialog>
 
+      {/* Dialog thêm / sửa đơn vị */}
       <Dialog open={unitDialogOpen} onClose={() => setUnitDialogOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>{unitDialogMode === 'add' ? 'Them don vi' : 'Sua don vi'}</DialogTitle>
+        <DialogTitle>{unitDialogMode === 'add' ? 'Thêm đơn vị' : 'Sửa đơn vị'}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField label="Ten" fullWidth value={unitForm.name} onChange={(e) => setUnitForm((f) => ({ ...f, name: e.target.value }))} />
-            <TextField label="Dia chi" fullWidth value={unitForm.address} onChange={(e) => setUnitForm((f) => ({ ...f, address: e.target.value }))} />
+            <TextField label="Tên đơn vị" fullWidth value={unitForm.name} onChange={(e) => setUnitForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Địa chỉ" fullWidth value={unitForm.address} onChange={(e) => setUnitForm((f) => ({ ...f, address: e.target.value }))} />
             <Stack direction="row" spacing={2}>
-              <TextField label="Lat" value={unitForm.lat} onChange={(e) => setUnitForm((f) => ({ ...f, lat: e.target.value }))} />
-              <TextField label="Lng" value={unitForm.lng} onChange={(e) => setUnitForm((f) => ({ ...f, lng: e.target.value }))} />
+              <TextField label="Vĩ độ (Lat)" value={unitForm.lat} onChange={(e) => setUnitForm((f) => ({ ...f, lat: e.target.value }))} />
+              <TextField label="Kinh độ (Lng)" value={unitForm.lng} onChange={(e) => setUnitForm((f) => ({ ...f, lng: e.target.value }))} />
             </Stack>
             <UnitLocationPicker lat={unitForm.lat ? Number(unitForm.lat) : null} lng={unitForm.lng ? Number(unitForm.lng) : null}
               onChange={(lat, lng) => setUnitForm((f) => ({ ...f, lat: String(lat), lng: String(lng) }))} />
-            <FormControlLabel control={<Switch checked={unitForm.remoteAccessReady} onChange={(e) => setUnitForm((f) => ({ ...f, remoteAccessReady: e.target.checked }))} />} label="Remote Access" />
-            <FormControlLabel control={<Switch checked={unitForm.isSupportStation} onChange={(e) => setUnitForm((f) => ({ ...f, isSupportStation: e.target.checked }))} disabled={stationLocked} />} label="Tram ung cuu" />
+            <FormControlLabel control={<Switch checked={unitForm.remoteAccessReady} onChange={(e) => setUnitForm((f) => ({ ...f, remoteAccessReady: e.target.checked }))} />} label="Cho phép truy cập từ xa" />
+            <FormControlLabel control={<Switch checked={unitForm.isSupportStation} onChange={(e) => setUnitForm((f) => ({ ...f, isSupportStation: e.target.checked }))} disabled={stationLocked} />} label="Là trạm ứng cứu" />
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setUnitDialogOpen(false)}>Huy</Button>
-          <Button variant="contained" onClick={handleSubmitUnit}>Luu</Button>
+          <Button onClick={() => setUnitDialogOpen(false)}>Huỷ</Button>
+          <Button variant="contained" onClick={handleSubmitUnit}>Lưu</Button>
         </DialogActions>
       </Dialog>
 
+      {/* Dialog thêm / sửa kỹ thuật viên */}
       <Dialog open={techDialogOpen} onClose={() => setTechDialogOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>{techDialogMode === 'add' ? 'Them KTV' : 'Sua KTV'}</DialogTitle>
+        <DialogTitle>{techDialogMode === 'add' ? 'Thêm kỹ thuật viên' : 'Sửa kỹ thuật viên'}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField label="Ten" fullWidth value={techForm.name} onChange={(e) => setTechForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Tên" fullWidth value={techForm.name} onChange={(e) => setTechForm((f) => ({ ...f, name: e.target.value }))} />
             <FormControl fullWidth>
-              <InputLabel>Ky nang</InputLabel>
+              <InputLabel>Kỹ năng</InputLabel>
               <Select multiple value={techForm.skills} onChange={(e) => setTechForm((f) => ({ ...f, skills: e.target.value as string[] }))}
                 renderValue={(sel) => sel.join(', ')}>
                 {skills.map((s) => (
@@ -1268,145 +1298,154 @@ function CompanyPortal({ user }: CompanyPortalProps) {
                 ))}
               </Select>
             </FormControl>
-            <FormControlLabel control={<Switch checked={techForm.availableNow} onChange={(e) => setTechForm((f) => ({ ...f, availableNow: e.target.checked }))} />} label="San sang" />
-            <Typography variant="subtitle2">dMatrix</Typography>
+            <FormControlLabel control={<Switch checked={techForm.availableNow} onChange={(e) => setTechForm((f) => ({ ...f, availableNow: e.target.checked }))} />} label="Sẵn sàng nhận nhiệm vụ" />
+            <Typography variant="subtitle2">Bảng thời gian xử lý (dMatrix)</Typography>
             {techForm.dMatrixRows.map((row, idx) => (
               <Stack key={idx} direction="row" spacing={1} alignItems="center">
                 <FormControl sx={{ minWidth: 120 }}>
-                  <InputLabel>Loai</InputLabel>
+                  <InputLabel>Loại SC</InputLabel>
                   <Select value={row.typeCode} onChange={(e) => {
                     const r = [...techForm.dMatrixRows]; r[idx] = { ...r[idx], typeCode: e.target.value as string }; setTechForm((f) => ({ ...f, dMatrixRows: r }))
                   }}>{incidentTypes.map((it) => <MenuItem key={it._id} value={it.code}>{it.code}</MenuItem>)}</Select>
                 </FormControl>
-                <FormControl sx={{ minWidth: 80 }}>
-                  <InputLabel>Mode</InputLabel>
+                <FormControl sx={{ minWidth: 100 }}>
+                  <InputLabel>Chế độ</InputLabel>
                   <Select value={row.mode} onChange={(e) => {
                     const r = [...techForm.dMatrixRows]; r[idx] = { ...r[idx], mode: e.target.value as 'R' | 'O' }; setTechForm((f) => ({ ...f, dMatrixRows: r }))
-                  }}><MenuItem value="R">R</MenuItem><MenuItem value="O">O</MenuItem></Select>
+                  }}><MenuItem value="R">Từ xa</MenuItem><MenuItem value="O">Tại chỗ</MenuItem></Select>
                 </FormControl>
-                <TextField label="h" type="number" value={row.durationHours} onChange={(e) => {
+                <TextField label="Giờ (h)" type="number" value={row.durationHours} onChange={(e) => {
                   const r = [...techForm.dMatrixRows]; r[idx] = { ...r[idx], durationHours: e.target.value }; setTechForm((f) => ({ ...f, dMatrixRows: r }))
-                }} sx={{ width: 80 }} />
+                }} sx={{ width: 90 }} />
                 <Button size="small" color="error" onClick={() => {
                   setTechForm((f) => ({ ...f, dMatrixRows: f.dMatrixRows.filter((_, i) => i !== idx) }))
-                }}>Xoa</Button>
+                }}>Xoá</Button>
               </Stack>
             ))}
-            <Button size="small" onClick={() => setTechForm((f) => ({ ...f, dMatrixRows: [...f.dMatrixRows, { typeCode: '', mode: 'R', durationHours: '' }] }))}>Them dong</Button>
+            <Button size="small" onClick={() => setTechForm((f) => ({ ...f, dMatrixRows: [...f.dMatrixRows, { typeCode: '', mode: 'R', durationHours: '' }] }))}>+ Thêm dòng</Button>
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setTechDialogOpen(false)}>Huy</Button>
-          <Button variant="contained" onClick={handleSubmitTech}>Luu</Button>
+          <Button onClick={() => setTechDialogOpen(false)}>Huỷ</Button>
+          <Button variant="contained" onClick={handleSubmitTech}>Lưu</Button>
         </DialogActions>
       </Dialog>
 
+      {/* Dialog thêm / sửa công cụ */}
       <Dialog open={toolDialogOpen} onClose={() => setToolDialogOpen(false)} maxWidth="xs" fullWidth>
-        <DialogTitle>{toolDialogMode === 'add' ? 'Them cong cu' : 'Sua cong cu'}</DialogTitle>
+        <DialogTitle>{toolDialogMode === 'add' ? 'Thêm công cụ' : 'Sửa công cụ'}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField label="Ten" fullWidth value={toolForm.name} onChange={(e) => setToolForm((f) => ({ ...f, name: e.target.value }))} />
-            <TextField label="Ma" fullWidth value={toolForm.typeCode} onChange={(e) => setToolForm((f) => ({ ...f, typeCode: e.target.value }))} />
-            <TextField label="SL" type="number" fullWidth value={toolForm.availableQty} onChange={(e) => setToolForm((f) => ({ ...f, availableQty: Number(e.target.value) }))} />
+            <TextField label="Tên" fullWidth value={toolForm.name} onChange={(e) => setToolForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Mã" fullWidth value={toolForm.typeCode} onChange={(e) => setToolForm((f) => ({ ...f, typeCode: e.target.value }))} />
+            <TextField label="Số lượng" type="number" fullWidth value={toolForm.availableQty} onChange={(e) => setToolForm((f) => ({ ...f, availableQty: Number(e.target.value) }))} />
           </Stack>
         </DialogContent>
-        <DialogActions><Button onClick={() => setToolDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitTool}>Luu</Button></DialogActions>
+        <DialogActions><Button onClick={() => setToolDialogOpen(false)}>Huỷ</Button><Button variant="contained" onClick={handleSubmitTool}>Lưu</Button></DialogActions>
       </Dialog>
 
+      {/* Dialog thêm / sửa phần mềm */}
       <Dialog open={licenseDialogOpen} onClose={() => setLicenseDialogOpen(false)} maxWidth="xs" fullWidth>
-        <DialogTitle>{licenseDialogMode === 'add' ? 'Them PM' : 'Sua PM'}</DialogTitle>
+        <DialogTitle>{licenseDialogMode === 'add' ? 'Thêm phần mềm' : 'Sửa phần mềm'}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField label="Ten" fullWidth value={licenseForm.name} onChange={(e) => setLicenseForm((f) => ({ ...f, name: e.target.value }))} />
-            <TextField label="Ma" fullWidth value={licenseForm.typeCode} onChange={(e) => setLicenseForm((f) => ({ ...f, typeCode: e.target.value }))} />
-            <TextField label="Tong" type="number" fullWidth value={licenseForm.capTotal} onChange={(e) => setLicenseForm((f) => ({ ...f, capTotal: Number(e.target.value) }))} />
-            <TextField label="Dang dung" type="number" fullWidth value={licenseForm.inUseNow} onChange={(e) => setLicenseForm((f) => ({ ...f, inUseNow: Number(e.target.value) }))} />
+            <TextField label="Tên" fullWidth value={licenseForm.name} onChange={(e) => setLicenseForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Mã" fullWidth value={licenseForm.typeCode} onChange={(e) => setLicenseForm((f) => ({ ...f, typeCode: e.target.value }))} />
+            <TextField label="Tổng số" type="number" fullWidth value={licenseForm.capTotal} onChange={(e) => setLicenseForm((f) => ({ ...f, capTotal: Number(e.target.value) }))} />
+            <TextField label="Đang sử dụng" type="number" fullWidth value={licenseForm.inUseNow} onChange={(e) => setLicenseForm((f) => ({ ...f, inUseNow: Number(e.target.value) }))} />
           </Stack>
         </DialogContent>
-        <DialogActions><Button onClick={() => setLicenseDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitLicense}>Luu</Button></DialogActions>
+        <DialogActions><Button onClick={() => setLicenseDialogOpen(false)}>Huỷ</Button><Button variant="contained" onClick={handleSubmitLicense}>Lưu</Button></DialogActions>
       </Dialog>
 
+      {/* Dialog thêm / sửa phương tiện */}
       <Dialog open={vehicleDialogOpen} onClose={() => setVehicleDialogOpen(false)} maxWidth="xs" fullWidth>
-        <DialogTitle>{vehicleDialogMode === 'add' ? 'Them PT' : 'Sua PT'}</DialogTitle>
+        <DialogTitle>{vehicleDialogMode === 'add' ? 'Thêm phương tiện' : 'Sửa phương tiện'}</DialogTitle>
         <DialogContent>
-          <TextField label="SL" type="number" fullWidth value={vehicleForm.availableQty} onChange={(e) => setVehicleForm((f) => ({ ...f, availableQty: Number(e.target.value) }))} sx={{ mt: 1 }} />
+          <TextField label="Số lượng" type="number" fullWidth value={vehicleForm.availableQty} onChange={(e) => setVehicleForm((f) => ({ ...f, availableQty: Number(e.target.value) }))} sx={{ mt: 1 }} />
         </DialogContent>
-        <DialogActions><Button onClick={() => setVehicleDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitVehicle}>Luu</Button></DialogActions>
+        <DialogActions><Button onClick={() => setVehicleDialogOpen(false)}>Huỷ</Button><Button variant="contained" onClick={handleSubmitVehicle}>Lưu</Button></DialogActions>
       </Dialog>
 
+      {/* Dialog thêm / sửa kỹ năng */}
       <Dialog open={skillDialogOpen} onClose={() => setSkillDialogOpen(false)} maxWidth="xs" fullWidth>
-        <DialogTitle>{skillDialogMode === 'add' ? 'Them ky nang' : 'Sua ky nang'}</DialogTitle>
+        <DialogTitle>{skillDialogMode === 'add' ? 'Thêm kỹ năng' : 'Sửa kỹ năng'}</DialogTitle>
         <DialogContent>
-          <TextField label="Ten" fullWidth value={skillForm.name} onChange={(e) => setSkillForm({ name: e.target.value })} sx={{ mt: 1 }} />
+          <TextField label="Tên kỹ năng" fullWidth value={skillForm.name} onChange={(e) => setSkillForm({ name: e.target.value })} sx={{ mt: 1 }} />
         </DialogContent>
-        <DialogActions><Button onClick={() => setSkillDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitSkill}>Luu</Button></DialogActions>
+        <DialogActions><Button onClick={() => setSkillDialogOpen(false)}>Huỷ</Button><Button variant="contained" onClick={handleSubmitSkill}>Lưu</Button></DialogActions>
       </Dialog>
 
+      {/* Dialog thêm / sửa loại sự cố */}
       <Dialog open={incidentTypeDialogOpen} onClose={() => setIncidentTypeDialogOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>{incidentTypeDialogMode === 'add' ? 'Them loai SC' : 'Sua loai SC'}</DialogTitle>
+        <DialogTitle>{incidentTypeDialogMode === 'add' ? 'Thêm loại sự cố' : 'Sửa loại sự cố'}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField label="Ma" fullWidth value={incidentTypeForm.code} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, code: e.target.value }))} disabled={incidentTypeDialogMode === 'edit'} />
-            <TextField label="Ten" fullWidth value={incidentTypeForm.name} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, name: e.target.value }))} />
-            <TextField label="Uu tien" type="number" fullWidth value={incidentTypeForm.defaultPriority} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultPriority: Number(e.target.value) }))} />
-            <TextField label="Setup remote (h)" type="number" fullWidth value={incidentTypeForm.defaultSetupRemote} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultSetupRemote: Number(e.target.value) }))} />
-            <FormControlLabel control={<Switch checked={incidentTypeForm.defaultFeasRemote} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultFeasRemote: e.target.checked }))} />} label="Remote" />
-            <FormControlLabel control={<Switch checked={incidentTypeForm.defaultFeasOnsite} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultFeasOnsite: e.target.checked }))} />} label="Onsite" />
+            <TextField label="Mã" fullWidth value={incidentTypeForm.code} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, code: e.target.value }))} disabled={incidentTypeDialogMode === 'edit'} />
+            <TextField label="Tên" fullWidth value={incidentTypeForm.name} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, name: e.target.value }))} />
+            <TextField label="Độ ưu tiên mặc định" type="number" fullWidth value={incidentTypeForm.defaultPriority} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultPriority: Number(e.target.value) }))} />
+            <TextField label="Thời gian setup từ xa (h)" type="number" fullWidth value={incidentTypeForm.defaultSetupRemote} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultSetupRemote: Number(e.target.value) }))} />
+            <FormControlLabel control={<Switch checked={incidentTypeForm.defaultFeasRemote} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultFeasRemote: e.target.checked }))} />} label="Có thể xử lý từ xa" />
+            <FormControlLabel control={<Switch checked={incidentTypeForm.defaultFeasOnsite} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, defaultFeasOnsite: e.target.checked }))} />} label="Có thể xử lý tại chỗ" />
             <FormControl fullWidth>
-              <InputLabel>Ky nang</InputLabel>
+              <InputLabel>Kỹ năng yêu cầu</InputLabel>
               <Select multiple value={incidentTypeForm.requiredSkills} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, requiredSkills: e.target.value as string[] }))}
                 renderValue={(sel) => sel.join(', ')}>
                 {skills.map((s) => (<MenuItem key={s._id} value={s.name}><Checkbox checked={incidentTypeForm.requiredSkills.includes(s.name)} /><ListItemText primary={s.name} /></MenuItem>))}
               </Select>
             </FormControl>
-            <TextField label="Cong cu (R)" fullWidth value={incidentTypeForm.toolsR} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, toolsR: e.target.value }))} />
-            <TextField label="Cong cu (O)" fullWidth value={incidentTypeForm.toolsO} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, toolsO: e.target.value }))} />
-            <TextField label="PM (R)" fullWidth value={incidentTypeForm.licensesR} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, licensesR: e.target.value }))} />
-            <TextField label="PM (O)" fullWidth value={incidentTypeForm.licensesO} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, licensesO: e.target.value }))} />
-            <FormControlLabel control={<Switch checked={incidentTypeForm.requiresVehicleIfOnsite} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, requiresVehicleIfOnsite: e.target.checked }))} />} label="Can PT (onsite)" />
+            <TextField label="Công cụ (Từ xa) — cách nhau bằng dấu phẩy" fullWidth value={incidentTypeForm.toolsR} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, toolsR: e.target.value }))} />
+            <TextField label="Công cụ (Tại chỗ) — cách nhau bằng dấu phẩy" fullWidth value={incidentTypeForm.toolsO} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, toolsO: e.target.value }))} />
+            <TextField label="Phần mềm (Từ xa) — cách nhau bằng dấu phẩy" fullWidth value={incidentTypeForm.licensesR} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, licensesR: e.target.value }))} />
+            <TextField label="Phần mềm (Tại chỗ) — cách nhau bằng dấu phẩy" fullWidth value={incidentTypeForm.licensesO} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, licensesO: e.target.value }))} />
+            <FormControlLabel control={<Switch checked={incidentTypeForm.requiresVehicleIfOnsite} onChange={(e) => setIncidentTypeForm((f) => ({ ...f, requiresVehicleIfOnsite: e.target.checked }))} />} label="Cần phương tiện khi xử lý tại chỗ" />
           </Stack>
         </DialogContent>
-        <DialogActions><Button onClick={() => setIncidentTypeDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSubmitIncidentType}>Luu</Button></DialogActions>
+        <DialogActions><Button onClick={() => setIncidentTypeDialogOpen(false)}>Huỷ</Button><Button variant="contained" onClick={handleSubmitIncidentType}>Lưu</Button></DialogActions>
       </Dialog>
 
+      {/* Dialog chỉnh sửa yêu cầu nguồn lực của sự cố */}
       <Dialog open={requirementsDialogOpen} onClose={() => setRequirementsDialogOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>Yeu cau su co</DialogTitle>
+        <DialogTitle>Yêu cầu nguồn lực của sự cố</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
             <FormControl fullWidth>
-              <InputLabel>Ky nang</InputLabel>
+              <InputLabel>Kỹ năng yêu cầu</InputLabel>
               <Select multiple value={requirementsForm.requiredSkills} onChange={(e) => setRequirementsForm((f) => ({ ...f, requiredSkills: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
                 {skills.map((s) => (<MenuItem key={s._id} value={s.name}><Checkbox checked={requirementsForm.requiredSkills.includes(s.name)} /><ListItemText primary={s.name} /></MenuItem>))}
               </Select>
             </FormControl>
             <FormControl fullWidth>
-              <InputLabel>Cong cu (R)</InputLabel>
+              <InputLabel>Công cụ (Từ xa)</InputLabel>
               <Select multiple value={requirementsForm.toolsR} onChange={(e) => setRequirementsForm((f) => ({ ...f, toolsR: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
                 {toolTypeOptions.map((t) => (<MenuItem key={t.typeCode} value={t.typeCode}><Checkbox checked={requirementsForm.toolsR.includes(t.typeCode)} /><ListItemText primary={t.name} /></MenuItem>))}
               </Select>
             </FormControl>
             <FormControl fullWidth>
-              <InputLabel>Cong cu (O)</InputLabel>
+              <InputLabel>Công cụ (Tại chỗ)</InputLabel>
               <Select multiple value={requirementsForm.toolsO} onChange={(e) => setRequirementsForm((f) => ({ ...f, toolsO: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
                 {toolTypeOptions.map((t) => (<MenuItem key={t.typeCode} value={t.typeCode}><Checkbox checked={requirementsForm.toolsO.includes(t.typeCode)} /><ListItemText primary={t.name} /></MenuItem>))}
               </Select>
             </FormControl>
             <FormControl fullWidth>
-              <InputLabel>PM (R)</InputLabel>
+              <InputLabel>Phần mềm (Từ xa)</InputLabel>
               <Select multiple value={requirementsForm.licensesR} onChange={(e) => setRequirementsForm((f) => ({ ...f, licensesR: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
                 {licenseTypeOptions.map((l) => (<MenuItem key={l.typeCode} value={l.typeCode}><Checkbox checked={requirementsForm.licensesR.includes(l.typeCode)} /><ListItemText primary={l.name} /></MenuItem>))}
               </Select>
             </FormControl>
             <FormControl fullWidth>
-              <InputLabel>PM (O)</InputLabel>
+              <InputLabel>Phần mềm (Tại chỗ)</InputLabel>
               <Select multiple value={requirementsForm.licensesO} onChange={(e) => setRequirementsForm((f) => ({ ...f, licensesO: e.target.value as string[] }))} renderValue={(s) => s.join(', ')}>
                 {licenseTypeOptions.map((l) => (<MenuItem key={l.typeCode} value={l.typeCode}><Checkbox checked={requirementsForm.licensesO.includes(l.typeCode)} /><ListItemText primary={l.name} /></MenuItem>))}
               </Select>
             </FormControl>
-            <FormControlLabel control={<Switch checked={requirementsForm.requiresVehicleIfOnsite} onChange={(e) => setRequirementsForm((f) => ({ ...f, requiresVehicleIfOnsite: e.target.checked }))} />} label="Can PT (onsite)" />
+            <FormControlLabel control={<Switch checked={requirementsForm.requiresVehicleIfOnsite} onChange={(e) => setRequirementsForm((f) => ({ ...f, requiresVehicleIfOnsite: e.target.checked }))} />} label="Cần phương tiện khi xử lý tại chỗ" />
           </Stack>
         </DialogContent>
-        <DialogActions><Button onClick={() => setRequirementsDialogOpen(false)}>Huy</Button><Button variant="contained" onClick={handleSaveRequirements}>Luu</Button></DialogActions>
+        <DialogActions>
+          <Button onClick={() => setRequirementsDialogOpen(false)}>Huỷ</Button>
+          <Button variant="contained" onClick={handleSaveRequirements}>Lưu</Button>
+        </DialogActions>
       </Dialog>
     </Stack>
   )
