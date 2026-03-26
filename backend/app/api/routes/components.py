@@ -9,57 +9,101 @@ router = APIRouter()
 
 
 @router.get("", response_model=list[ComponentInDB])
-async def list_components(
+async def lay_danh_sach_bien_che(
     scope: str = Query(default="company"),
+    unitId: str | None = Query(default=None), 
     user: dict = Depends(get_current_user),
 ):
+
     db = get_db()
+
     if user.get("role") == Role.UNIT_USER.value:
-        query = {"companyId": user["companyId"], "unitId": user["unitId"]}
+        tieu_chi = {"companyId": user["companyId"], "unitId": user["unitId"]}
     else:
-        if scope not in ("company", "unit"):
-            raise HTTPException(status_code=400, detail="Invalid scope")
-        query = {"companyId": user["companyId"]}
-    docs = await db.components.find(query).to_list(2000)
-    return serialize_docs(docs)
+        tieu_chi = {"companyId": user["companyId"]}
+        if unitId:
+            tieu_chi["unitId"] = unitId
+
+    ban_ghi = await db.components.find(tieu_chi).to_list(2000)
+    return serialize_docs(ban_ghi)
 
 
 @router.post("", response_model=ComponentInDB)
-async def create_component(payload: ComponentCreate, user: dict = Depends(require_role(Role.UNIT_USER))):
+async def tao_bien_che(
+    payload: ComponentCreate,
+    user: dict = Depends(get_current_user),
+):
+   
+   
     db = get_db()
-    if payload.unitId != user["unitId"]:
-        raise HTTPException(status_code=403, detail="Unit mismatch")
-    unit = await db.units.find_one({"_id": oid(payload.unitId), "companyId": user["companyId"]})
-    if not unit:
-        raise HTTPException(status_code=404, detail="Unit not found")
-    doc = payload.model_dump()
-    doc["companyId"] = user["companyId"]
-    result = await db.components.insert_one(doc)
-    created = await db.components.find_one({"_id": result.inserted_id})
-    return serialize_doc(created)
+
+    if user["role"] == Role.UNIT_USER.value:
+        if payload.unitId != user["unitId"]:
+            raise HTTPException(status_code=403, detail="Bạn chỉ được thêm thiết bị cho đơn vị của mình")
+    elif user["role"] == Role.COMPANY_ADMIN.value:
+        don_vi = await db.units.find_one({"_id": oid(payload.unitId), "companyId": user["companyId"]})
+        if not don_vi:
+            raise HTTPException(status_code=404, detail="Không tìm thấy đơn vị trong công ty của bạn")
+    else:
+        raise HTTPException(status_code=403, detail="Không có quyền thực hiện thao tác này")
+
+    ban_ghi = payload.model_dump()
+    ban_ghi["companyId"] = user["companyId"]
+    ket_qua = await db.components.insert_one(ban_ghi)
+    da_tao = await db.components.find_one({"_id": ket_qua.inserted_id})
+    return serialize_doc(da_tao)
 
 
 @router.patch("/{component_id}", response_model=ComponentInDB)
-async def update_component(component_id: str, payload: ComponentUpdate, user: dict = Depends(require_role(Role.UNIT_USER))):
+async def cap_nhat_bien_che(
+    component_id: str,
+    payload: ComponentUpdate,
+    user: dict = Depends(get_current_user),
+):
+
     db = get_db()
-    update = {k: v for k, v in payload.model_dump().items() if v is not None}
-    if update:
-        await db.components.update_one(
-            {"_id": oid(component_id), "companyId": user["companyId"], "unitId": user["unitId"]},
-            {"$set": update},
-        )
-    doc = await db.components.find_one(
-        {"_id": oid(component_id), "companyId": user["companyId"], "unitId": user["unitId"]}
-    )
-    if not doc:
-        raise HTTPException(status_code=404, detail="Component not found")
-    return serialize_doc(doc)
+    cap_nhat = {k: v for k, v in payload.model_dump().items() if v is not None}
+
+    if user["role"] == Role.UNIT_USER.value:
+        tieu_chi = {
+            "_id": oid(component_id),
+            "companyId": user["companyId"],
+            "unitId": user["unitId"],
+        }
+    else:
+        tieu_chi = {
+            "_id": oid(component_id),
+            "companyId": user["companyId"],
+        }
+
+    if cap_nhat:
+        await db.components.update_one(tieu_chi, {"$set": cap_nhat})
+
+    ban_ghi = await db.components.find_one(tieu_chi)
+    if not ban_ghi:
+        raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị")
+    return serialize_doc(ban_ghi)
 
 
 @router.delete("/{component_id}")
-async def delete_component(component_id: str, user: dict = Depends(require_role(Role.UNIT_USER))):
+async def xoa_bien_che(
+    component_id: str,
+    user: dict = Depends(get_current_user),
+):
+
     db = get_db()
-    await db.components.delete_one(
-        {"_id": oid(component_id), "companyId": user["companyId"], "unitId": user["unitId"]}
-    )
+
+    if user["role"] == Role.UNIT_USER.value:
+        tieu_chi = {
+            "_id": oid(component_id),
+            "companyId": user["companyId"],
+            "unitId": user["unitId"],
+        }
+    else:
+        tieu_chi = {
+            "_id": oid(component_id),
+            "companyId": user["companyId"],
+        }
+
+    await db.components.delete_one(tieu_chi)
     return {"ok": True}
